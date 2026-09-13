@@ -70,7 +70,7 @@ def main():
     ap.add_argument("--epochs-per-batch", type=int, default=1, help="inner PPO-style epochs (mu>1 needs ratios)")
     ap.add_argument("--kl-coef", type=float, default=0.0)
     ap.add_argument("--clip", type=float, default=0.2)
-    ap.add_argument("--max-new-tokens", type=int, default=8)
+    ap.add_argument("--max-new-tokens", type=int, default=6)
     ap.add_argument("--micro-batch", type=int, default=24,
                     help="rows per forward/backward chunk (memory bound on K80)")
     ap.add_argument("--out-dir", default="runs/grpo")
@@ -130,9 +130,9 @@ def main():
         if args.temp_end is not None:
             frac = min(1.0, (step - 1) / max(1, args.steps - 1))
             temp = args.temperature + frac * (args.temp_end - args.temperature)
-        # ---------- rollout (no grad) ----------
+        # ---------- rollout (no grad, fp16 autocast for ~2x faster K80 generation) ----------
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             prompts, boards, texts, gen_ids, rewards, group = rollout_batch(
                 model, tok, args.prompts_per_step, args.group, temp,
                 device, args.max_new_tokens, n_mines=mines_for(step))
