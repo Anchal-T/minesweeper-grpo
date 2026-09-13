@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--group", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-6)
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temp-end", type=float, default=None,
+                    help="linearly anneal rollout temperature to this by the last step")
     ap.add_argument("--epochs-per-batch", type=int, default=1, help="inner PPO-style epochs (mu>1 needs ratios)")
     ap.add_argument("--kl-coef", type=float, default=0.0)
     ap.add_argument("--clip", type=float, default=0.2)
@@ -109,11 +111,15 @@ def main():
     t0 = time.time()
     model.train()
     for step in range(1, args.steps + 1):
+        temp = args.temperature
+        if args.temp_end is not None:
+            frac = min(1.0, (step - 1) / max(1, args.steps - 1))
+            temp = args.temperature + frac * (args.temp_end - args.temperature)
         # ---------- rollout (no grad) ----------
         model.eval()
         with torch.no_grad():
             prompts, boards, texts, gen_ids, rewards, group = rollout_batch(
-                model, tok, args.prompts_per_step, args.group, args.temperature,
+                model, tok, args.prompts_per_step, args.group, temp,
                 device, args.max_new_tokens)
             rep_prompts = [p for p in prompts for _ in range(group)]
             ctx_ids, ctx_attn = prompt_token_padded(tok, rep_prompts, device)
