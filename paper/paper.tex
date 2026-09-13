@@ -1,0 +1,175 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+
+\title{Specializing a Small Language Model in Minesweeper\\
+\large Group Relative Policy Optimization on Consumer-GPUs-Old Hardware}
+\author{Anchal Gupta}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We take GPT-2 (124M parameters) and specialize it in playing 6$\times$6 minesweeper
+(6 mines) using Group Relative Policy Optimization (GRPO) with verifiable,
+programmatically-computed rewards. The full pipeline --- SFT behavior-cloning
+warmup followed by on-policy GRPO --- runs on Tesla K80 GPUs (Kepler, sm\_37),
+a hardware target that excludes modern frameworks: no torch~2.x, no vLLM, no
+TRL. We therefore implement the GRPO training loop from scratch in
+torch~1.13.1. Training a small policy with RL against a text-game environment
+surfaced three failure modes that were silent or nearly silent at the metric
+level but catastrophic for learning: an impure reward function that mutated
+shared environment state across group rollouts, a train/inference position-id
+mismatch for padded rows, and brittle answer parsing. Fixing these took mean
+rollout reward from $-0.10$ (flat for hundreds of steps) to $+0.35$ and
+climbing, with the bad-move rate falling from $55\%$ to $16\%$. We document
+the training recipe, the failure modes, and a mine-count curriculum variant.
+\end{abstract}
+
+\section{Introduction}
+Reinforcement learning from verifiable rewards (RLVR) has become the standard
+recipe for specializing large language models on tasks with programmatic
+ground truth: mathematics, code, and games. In this regime the reward is
+computed by executing deterministic environment logic, so the learning signal
+is exact; the difficulty lies entirely in the optimization. We study this
+setting at the opposite end of the resource spectrum from typical RLVR work:
+the policy is GPT-2~\cite{radford2019gpt2}, the accelerator is a Tesla K80
+(2014, compute capability 3.7, 11\,GB GDDR5), and the software stack is frozen
+at torch~1.13.1 + CUDA 11.7, the last build supporting the card. Everything
+that modern RL stacks provide --- vLLM rollouts, TRL trainers, fused kernels,
+bf16 --- is unavailable.
+
+The task: given a text rendering of a mid-game minesweeper board, choose a
+hidden cell that is safe. A move that reveals cells earns reward proportional
+to the reveal; hitting a mine, clicking an open cell, or producing an
+unparseable answer is penalized. The model must learn to read the numeric
+constraints in the grid and act on them, entirely through scalar reward.
+
+\section{Environment and Reward}
+A board is a $6\times6$ grid with 6 mines (curriculum variant: 2--6). States
+are rendered as whitespace-separated rows; hidden cells are `.' and revealed
+cells show their adjacent-mine count. Each training prompt is a fresh random
+mid-game state, produced by seeding one random safe cell and flood-filling, so
+the state distribution matches genuine play.
+
+The action is the model's completion of the prompt suffix
+\texttt{Answer:}, e.g.\ \texttt{3,4}. The first \texttt{row,col} pair in the
+completion (regex-parsed) is the move. The reward is verifiable and dense:
+\begin{equation}
+r(s,a) \;=\;
+\begin{cases}
+-1.0 & \text{mine, off-board, or unparseable}\\
+-0.5 & \text{clicked an already-revealed cell}\\
+0.5 + 0.5\cdot \dfrac{n_{\text{revealed}}(s,a)}{|H(s)|} & \text{safe click},
+\end{cases}
+\end{equation}
+where $n_{\text{revealed}}$ is the flood-fill gain and $H(s)$ the hidden set.
+Full-game evaluation plays greedily (or at temperature $\tau$) until the board
+is solved, a mine is hit, or a move limit is reached, and reports win rate and
+cleared fraction.
+
+\section{Training Pipeline}
+\paragraph{SFT warmup.} We first behavior-clone a ground-truth expert (the
+safe cell whose flood fill reveals the most, with deterministic row-major
+tie-breaking) on random mid-game states: 600 steps, batch 32--64, lr
+$10^{-5}$, fp16 autocast with gradient scaling. Random tie-breaking was
+intentionally removed: with many equally-good cells, inconsistent targets
+kept the SFT loss above $0.95$ and produced a degenerate greedy policy.
+\paragraph{GRPO.} Each step samples $P{=}12$ fresh boards and $G{=}8$
+completions per board from the current policy (temperature 1.0). Rewards are
+group-normalized,
+\begin{equation}
+A_i = \frac{r_i - \mathrm{mean}(r_{1..G})}{\mathrm{std}(r_{1..G}) + \epsilon},
+\end{equation}
+and the policy gradient $-\sum_i \sum_t A_i \log \pi_\theta(y_{i,t})$ is
+applied over answer tokens only, with AdamW (lr $10^{-5}$), gradient clipping
+at 1.0, and an optional KL penalty to the frozen reference policy
+($\beta{=}0.05$). Because rollouts and training share the same weights
+in-process, no importance-ratio correction is needed for one inner epoch.
+Updates are microbatched (24 rows) to fit K80 memory alongside co-tenant jobs.
+
+\section{Three Nearly-Silent Failure Modes}
+\subsection{Impure reward across group rollouts}
+The reward function originally computed the flood-fill gain by revealing
+cells \emph{on the shared board}. All $G$ rollouts of a group score the same
+nominal state, so sample $k$'s reward was computed on the board mutated by
+samples $1..k{-}1$: a cell safe for sample 1 scored as a wasted click for
+sample 5. Identical actions received order-dependent rewards, advantages were
+pure noise correlated with sample order, and mean reward sat flat at
+$-0.10$ for hundreds of steps while the trainer appeared healthy. The fix ---
+score every rollout against an untouched probe copy --- was a five-line
+change and immediately moved mean reward from $-0.10$ to $+0.35$ (Figure
+placeholder). \emph{Lesson: reward functions must be pure with respect to
+state when multiple actions are scored against one state; mutation bugs in
+the reward are invisible in the loss curve.}
+
+\subsection{Position-id mismatch for padded rows}
+HF \texttt{generate} computes position ids from the attention mask cumsum,
+correctly handling left-padded batches. Our training-side log-prob path did
+not pass position ids, so GPT-2 received \texttt{arange} positions: for every
+row shorter than the batch max, answer tokens sat at shifted positions with a
+gap after the context padding. The policy trained under a distribution shift
+it never saw at inference. Passing
+$\mathrm{pos} = \mathrm{cumsum}(\mathrm{mask}) - 1$ in training (matching
+\texttt{generate}) lifted full-game clearing from $44\%$ to $64\%$ of safe
+cells at equal training budget. \emph{Lesson: any hand-rolled scoring path
+must replicate \texttt{generate}'s position handling exactly.}
+
+\subsection{Brittle answer parsing}
+The completion is sampled greedily in structure but the model repeats
+patterns: \texttt{2,1,1,4,} with no whitespace. A parser demanding exactly
+two comma-separated integers per whitespace token rejected every completion,
+so all rewards were $-1$, all group variances zero, and all advantages zero:
+GRPO silently became the identity update. Regex-parsing the first
+\texttt{d+,d+} pair fixed it. \emph{Lesson: with verifiable rewards, the
+parser is part of the reward; test it on real model output, not idealized
+strings.}
+
+We additionally observed fp16 gradient-scaler skips (normal, transient),
+mode collapse without a KL anchor (irreversible within 100 steps at lr
+$3{\times}10^{-5}$), and GPT-2's missing pad token.
+
+\section{Results}
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Model & Win rate & Cleared fraction & Mean rollout reward \\
+\midrule
+Random click & $\approx 0$ & $\approx 0.15$ & $\approx 0.35$ (one-move) \\
+SFT warmup (600 steps) & \textbf{TODO} & 0.64 & \textbf{TODO} \\
+GRPO from SFT (KL 0.05) & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} \\
+GRPO, mine-count curriculum 2$\to$4$\to$6 & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} \\
+\bottomrule
+\end{tabular}
+\caption{Final 30--100 game evaluations. Filled after training completes.}
+\end{table}
+
+\section{Hardware and Throughput}
+All runs share the machine with unrelated co-tenant jobs. Measured on K80:
+GPT-2 fp16 eager generation at batch 96$\times$90 tokens, SFT $\approx$5\,s/step
+(batch 32), GRPO $\approx$12--17\,s/step (96 rollouts + update), limited by
+co-tenant memory pressure and kernel-launch overhead on the 124M model.
+Rolling out in fp16 autocast rather than fp32 roughly halved generation cost.
+
+\section{Conclusion}
+A 2014 GPU and a 2022 torch build are sufficient to run GRPO on a small LM
+against a verifiable game environment, provided the trainer is written from
+scratch and its assumptions are instrumented. The dominant risks are not
+exotic: they are impure reward functions, position-id mismatches, and brittle
+output parsing --- each invisible in the loss curve and each fixable in
+minutes once observed in rollout diagnostics.
+
+\begin{thebibliography}{9}
+\bibitem{radford2019gpt2} A.~Radford et al. Language Models are Unsupervised Multitask Learners. 2019.
+\bibitem{shao2024deepseekmath} Z.~Shao et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. 2024. (GRPO)
+\end{thebibliography}
+
+\end{document}
