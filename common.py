@@ -62,7 +62,11 @@ def token_logprobs(model, ctx_ids, answer_ids, attn_mask=None):
     attn = (full != PAD_ID).long()
     # force first token of each row attended
     attn[:, 0] = 1
-    logits = model(input_ids=full, attention_mask=attn).logits  # [B, Lc+La, V]
+    # match generate(): position ids must count only real tokens, otherwise
+    # answer tokens get shifted positions on shorter-than-max rows
+    position_ids = attn.cumsum(-1) - 1
+    position_ids.clamp_(min=0)
+    logits = model(input_ids=full, attention_mask=attn, position_ids=position_ids).logits
     # predict answer token t from position Lc-1+t
     pos = torch.arange(Lc - 1, Lc + La - 1, device=full.device)
     pred_logits = logits[:, pos, :]  # [B, La, V]

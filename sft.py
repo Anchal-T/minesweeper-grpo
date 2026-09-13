@@ -28,7 +28,9 @@ def loss_on_batch(model, ctx_ids, ctx_attn, ans_ids, ans_attn):
     B, Lc = ctx_ids.shape
     full = torch.cat([ctx_ids, ans_ids], dim=1)
     attn = torch.cat([ctx_attn, ans_attn], dim=1)
-    logits = model(input_ids=full, attention_mask=attn).logits
+    position_ids = attn.cumsum(-1) - 1
+    position_ids.clamp_(min=0)
+    logits = model(input_ids=full, attention_mask=attn, position_ids=position_ids).logits
     pos = torch.arange(Lc - 1, full.shape[1] - 1, device=full.device)
     pred = logits[:, pos, :]
     tgt = full[:, Lc:]  # answer tokens
