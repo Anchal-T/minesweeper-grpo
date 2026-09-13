@@ -127,17 +127,15 @@ def expert_move(board, rng=None):
 
 
 def parse_move(text):
-    """Parse 'row,col' out of a completion; returns (r, c) or None."""
-    for tok in text.replace("<answer>", "").replace("</answer>", " ").split():
-        parts = tok.strip(".,;:()[]").split(",")
-        if len(parts) != 2:
-            continue
-        try:
-            r, c = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        return r, c
-    return None
+    """Parse the first 'row,col' pair out of a completion; returns (r, c) or None.
+
+    Completions may repeat pairs ('2,1,1,4,') with no whitespace, so use a
+    regex instead of token splitting."""
+    import re
+    m = re.search(r"(\d+)\s*,\s*(\d+)", text)
+    if m is None:
+        return None
+    return int(m.group(1)), int(m.group(2))
 
 
 def play_episode(board, move_fn, max_moves=None):
