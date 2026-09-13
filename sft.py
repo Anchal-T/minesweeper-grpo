@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--out", default="sft.pt")
+    ap.add_argument("--save-every", type=int, default=200)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -69,6 +70,10 @@ def main():
         if step % 50 == 0 or step == 1:
             print(f"step {step:5d}  sft_loss {loss.item():.4f}  "
                   f"({(time.time()-t0)/step:.2f}s/step)", flush=True)
+
+        if step % args.save_every == 0:
+            torch.save(model.state_dict(), args.out)
+            print(f"  checkpoint saved -> {args.out}", flush=True)
 
     torch.save(model.state_dict(), args.out)
     print(f"saved -> {args.out}")
