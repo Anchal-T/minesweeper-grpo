@@ -19,7 +19,7 @@ class Minesweeper:
         # seed the game with one random safe cell + flood fill, so states are
         # mid-game positions rather than a fully hidden board
         safe = [c for c in cells if c not in self.mines]
-        self._flood(rng.choice(safe))
+        self._flood(*rng.choice(safe))
 
     def _neighbors(self, r, c):
         for dr in (-1, 0, 1):
