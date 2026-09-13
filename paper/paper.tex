@@ -6,170 +6,698 @@
 \usepackage{xcolor}
 \usepackage{hyperref}
 \usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
 
-\title{Specializing a Small Language Model in Minesweeper\\
-\large Group Relative Policy Optimization on Consumer-GPUs-Old Hardware}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  framerule=0.3pt,
+  columns=fullflexible,
+  showstringspaces=false,
+  language=Python,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!40!black},
+}
+
+\title{Teaching a 2014 GPU to Teach a 2019 Model a 1989 Game:\\
+A Complete Record of GRPO Fine-Tuning GPT-2 for Minesweeper\\
+on Tesla K80 Hardware}
 \author{Anchal Gupta}
-\date{September 2026}
+\date{September 13, 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-We take GPT-2 (124M parameters) and specialize it in playing 6$\times$6 minesweeper
-(6 mines) using Group Relative Policy Optimization (GRPO) with verifiable,
-programmatically-computed rewards. The full pipeline --- SFT behavior-cloning
-warmup followed by on-policy GRPO --- runs on Tesla K80 GPUs (Kepler, sm\_37),
-a hardware target that excludes modern frameworks: no torch~2.x, no vLLM, no
-TRL. We therefore implement the GRPO training loop from scratch in
-torch~1.13.1. Training a small policy with RL against a text-game environment
-surfaced three failure modes that were silent or nearly silent at the metric
-level but catastrophic for learning: an impure reward function that mutated
-shared environment state across group rollouts, a train/inference position-id
-mismatch for padded rows, and brittle answer parsing. Fixing these took mean
-rollout reward from $-0.10$ (flat for hundreds of steps) to $+0.35$ and
-climbing, with the bad-move rate falling from $55\%$ to $16\%$. We document
-the training recipe, the failure modes, and a mine-count curriculum variant.
+This report is a complete record of an applied experiment: taking a small
+language model, GPT-2 (124M parameters), and specializing it in playing
+$6\times6$ minesweeper via Group Relative Policy Optimization (GRPO) against a
+programmatically-scored environment. The work was done on a shared machine
+with four Tesla K80 GPUs (Kepler, sm\_37, 2014), for which the newest usable
+PyTorch build is 1.13.1+cu117 --- a constraint that excludes torch~2.x, vLLM,
+TRL, FlashAttention, and bf16, and therefore required implementing the GRPO
+trainer from scratch. The experiment reached a working training loop only
+after diagnosing and fixing three defects that were almost invisible at the
+metric level but fatal to learning: an \emph{impure reward function} that
+mutated shared environment state across a rollout group, a
+\emph{train/inference position-id mismatch} for padded rows, and a \emph{brittle
+answer parser} that rejected every model completion and silently reduced GRPO
+to the identity update. Fixing the first moved mean rollout reward from a
+$-0.10$ plateau (stable for hundreds of steps) to $+0.35$ within 80 steps.
+We give the full environment and reward design, the SFT warmup recipe, the
+GRPO implementation, a step-by-step debugging record with the actual numbers
+observed at each stage, four training variants (including a mine-count
+curriculum), throughput engineering on constrained hardware, and an
+operational playbook for running long jobs on a heavily-shared multi-GPU
+machine.
 \end{abstract}
 
+\tableofcontents
+
 \section{Introduction}
-Reinforcement learning from verifiable rewards (RLVR) has become the standard
-recipe for specializing large language models on tasks with programmatic
-ground truth: mathematics, code, and games. In this regime the reward is
-computed by executing deterministic environment logic, so the learning signal
-is exact; the difficulty lies entirely in the optimization. We study this
-setting at the opposite end of the resource spectrum from typical RLVR work:
-the policy is GPT-2~\cite{radford2019gpt2}, the accelerator is a Tesla K80
-(2014, compute capability 3.7, 11\,GB GDDR5), and the software stack is frozen
-at torch~1.13.1 + CUDA 11.7, the last build supporting the card. Everything
-that modern RL stacks provide --- vLLM rollouts, TRL trainers, fused kernels,
-bf16 --- is unavailable.
 
-The task: given a text rendering of a mid-game minesweeper board, choose a
-hidden cell that is safe. A move that reveals cells earns reward proportional
-to the reveal; hitting a mine, clicking an open cell, or producing an
-unparseable answer is penalized. The model must learn to read the numeric
-constraints in the grid and act on them, entirely through scalar reward.
+\subsection{Motivation}
+Reinforcement learning with verifiable rewards (RLVR) is the standard recipe
+for specializing LLMs on tasks with programmatic ground truth. Minesweeper is
+a clean instance of this setting: the environment is a few dozen lines of
+deterministic Python, the reward is exact, and the policy --- a language model
+reading a text-rendered board and emitting a coordinate --- must learn genuine
+constraint reasoning from numeric clues purely through scalar feedback.
 
-\section{Environment and Reward}
-A board is a $6\times6$ grid with 6 mines (curriculum variant: 2--6). States
-are rendered as whitespace-separated rows; hidden cells are `.' and revealed
-cells show their adjacent-mine count. Each training prompt is a fresh random
-mid-game state, produced by seeding one random safe cell and flood-filling, so
-the state distribution matches genuine play.
+The deliberate constraint of this experiment is the hardware. The target
+machine has four Tesla K80 GPUs: compute capability 3.7 (Kepler), driver
+470.256.02, no support for any torch~2.x build, no bf16, no FlashAttention,
+and no vLLM. The last supported PyTorch is 1.13.1+cu117 (Python 3.10 wheels
+only). This makes off-the-shelf RL infrastructure (TRL's GRPOTrainer,
+vLLM-based rollout servers) unusable, so the entire training loop ---
+generation, log-prob computation, group-relative advantages, optimizer step ---
+was written from scratch against torch 1.13 semantics. A secondary constraint
+is that the machine is \emph{shared}: other users' jobs occupy GPU memory and
+compute unpredictably, which shaped both the memory engineering (microbatching,
+allocator tuning) and the operational playbook (Section~\ref{sec:ops}).
 
-The action is the model's completion of the prompt suffix
-\texttt{Answer:}, e.g.\ \texttt{3,4}. The first \texttt{row,col} pair in the
-completion (regex-parsed) is the move. The reward is verifiable and dense:
+\subsection{What this document is}
+Not a publication-ready claim of state-of-the-art play. It is a complete
+engineering record: everything we did, in order, including the mistakes ---
+with the actual logged numbers at each stage --- so that the next person
+running GRPO on constrained hardware can skip the failures.
+
+\section{The Task}
+
+\subsection{Environment}
+The game is $6\times6$ minesweeper with 6 mines (variant: 2--6 via
+curriculum). The environment (\texttt{env.py}) places mines uniformly at
+random, then seeds the game with one random safe cell followed by standard
+flood-fill revealing, so training prompts are genuine mid-game states rather
+than empty boards. A board renders as text, one row per line:
+
+\begin{lstlisting}[language={}, caption={A rendered mid-game state as the policy sees it.}]
+Minesweeper 6x6 grid, 6 mines. '.' = hidden, digit = adjacent mines.
+. . . . . .
+. . . . . .
+1 2 . . . .
+0 1 2 2 2 1
+0 0 0 0 0 0
+0 0 0 0 0 0
+Which hidden cell is safe? Answer with row,col (0-indexed). Answer:
+\end{lstlisting}
+
+Coordinates are 0-indexed \texttt{(row, col)}; a click reveals the cell and,
+if it is a zero cell, cascades like real minesweeper.
+
+\subsection{Reward function}
+The reward is verifiable and dense:
 \begin{equation}
-r(s,a) \;=\;
+r(s, a) \;=\;
 \begin{cases}
--1.0 & \text{mine, off-board, or unparseable}\\
--0.5 & \text{clicked an already-revealed cell}\\
-0.5 + 0.5\cdot \dfrac{n_{\text{revealed}}(s,a)}{|H(s)|} & \text{safe click},
+-1.0 & \text{mine hit, off-board, or unparseable answer}\\[2pt]
+-0.5 & \text{clicked an already-revealed cell (wasted turn)}\\[2pt]
+0.5 + 0.5 \cdot \dfrac{n_{\text{reveal}}(s,a)}{|H(s)|}
+& \text{safe click},
 \end{cases}
+\label{eq:reward}
 \end{equation}
-where $n_{\text{revealed}}$ is the flood-fill gain and $H(s)$ the hidden set.
-Full-game evaluation plays greedily (or at temperature $\tau$) until the board
-is solved, a mine is hit, or a move limit is reached, and reports win rate and
-cleared fraction.
+where $n_{\text{reveal}}$ is the number of cells revealed by the click
+including flood-fill cascade, and $H(s)$ is the set of hidden cells before the
+click. Safe rewards therefore range in $[0.5, 1.0]$, preferring moves that
+open up the board --- the same quantity the expert optimizes, which keeps the
+SFT warmup and the RL objective aligned.
+
+\subsection{Expert policy and SFT targets}
+The expert (used only for the SFT warmup) enumerates hidden cells, knows the
+mine locations, and picks the safe cell whose flood fill reveals the most,
+breaking ties \emph{deterministically} in row-major order. The deterministic
+tie-break matters and is a found bug (Section~\ref{sec:bug-ties}): with
+random tie-breaks, many boards have several equally-optimal targets, the SFT
+loss plateaus around $0.95$--$1.07$ nats/token, and the greedy policy
+degenerates to always answering \texttt{0,0}.
+
+\subsection{Answer parsing}
+The policy's completion is parsed with a regex that extracts the \emph{first}
+\texttt{digit,digit} pair:
+\begin{lstlisting}[caption={\texttt{parse\_move}: the parser is part of the reward.}]
+def parse_move(text):
+    m = re.search(r"(\d+)\s*,\s*(\d+)", text)
+    if m is None:
+        return None
+    return int(m.group(1)), int(m.group(2))
+\end{lstlisting}
+This tolerates the model's actual output distribution --- completions like
+\texttt{2,1,1,4,} (repeated pairs, no whitespace, no EOS) --- which an exact
+two-part tokenizer-style parser rejected \emph{en masse}, with catastrophic
+effect (Section~\ref{sec:bug-parse}).
+
+\subsection{Evaluation protocol}
+Full-game evaluation (\texttt{eval.py}) plays complete games with a single
+move function (greedy, or sampled at temperature $\tau$), stopping at solved
+board, mine hit, unparseable move (counted as a loss), or a move cap. We
+report win rate and the mean fraction of safe cells cleared. Single-move
+diagnostics (mine / waste / safe counts over fresh boards) are used to
+disambiguate failure modes during training.
+
+\section{System Implementation on K80-Constrained Hardware}
+\label{sec:system}
+
+\subsection{Software stack}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+Component & Version / note \\
+\midrule
+GPU & $4\times$ Tesla K80 (GK210, sm\_37), 11\,441\,MiB each, shared \\
+Driver / CUDA & 470.256.02 / 11.4 \\
+Python & 3.10.21 (uv-managed venv per project) \\
+PyTorch & 1.13.1+cu117 (last K80-compatible build) \\
+Transformers & 4.36.2 (GPT-2; eager attention; \texttt{generate} handles left-pad positions) \\
+numpy & 1.26.4 ($<$2 required by torch 1.13) \\
+matplotlib & 0.3.x-era wheel, for figures \\
+Tokenizer & GPT-2 BPE, \texttt{pad\_token = eos} (GPT-2 has no pad token) \\
+Precision & fp16 \texttt{autocast} + \texttt{GradScaler} everywhere (no bf16) \\
+Attention & eager (no SDPA/FlashAttention on this stack) \\
+\bottomrule
+\end{tabular}
+\caption{Stack. Everything downstream of ``Transformers'' is custom code.}
+\end{table}
+
+\subsection{Memory engineering}
+GPU memory is the binding constraint because the box is shared; co-tenant
+jobs routinely grow from 1.8\,GB to 8--10\,GB mid-run, and we OOM-crashed four
+times before adopting these rules:
+\begin{itemize}
+\item \textbf{Microbatched GRPO update.} The update computes answer-token
+log-probs over all $P\cdot G = 96$ (prompt, completion) rows. A single
+full-batch forward materializes logits of shape
+$[96, \sim 90, 50257]$ (fp16) plus backward buffers --- measured at
+$\sim$9.5\,GB reserved, which OOMs on any GPU with a co-tenant. The update
+therefore runs in row-chunks of 24, each chunk contributing
+$-\sum A_i \log \pi(y_i) \,/\, \sum m$ (normalized by the \emph{full}-batch
+token count so chunk gradients sum exactly to the full-batch gradient), with
+one optimizer step after all chunks.
+\item \textbf{Allocator tuning:} \texttt{PYTORCH\_CUDA\_ALLOC\_CONF=
+max\_split\_size\_mb:128} to reduce fragmentation-driven OOM.
+\item \textbf{Batch sizes:} SFT batch 32 (64 fits only on an empty GPU),
+GRPO microbatch 24, rollouts generated as one batch of 96 short sequences.
+\item \textbf{GPU selection by free memory at launch}, not by index --- the
+``second GPU'' is frequently the wrong choice hours later.
+\end{itemize}
+
+\subsection{Precision}
+All forwards run under \texttt{torch.autocast("cuda", float16)} with a
+\texttt{GradScaler} wrapping the backward. Two observations worth recording:
+\begin{itemize}
+\item The scaler legitimately skips steps: in a controlled instrumented run
+the scale decayed $32768 \to 16384 \to 8192$ over the first three steps while
+gradient norms read \texttt{nan}/\texttt{inf}, then stabilized with gradient
+norms around 4--6. This is transient and healthy; a \emph{persistent} flat
+reward curve is \emph{not} explained by it (we checked --- see
+Section~\ref{sec:bug-parse}).
+\item Generation in fp16 matters: the rollout loop originally ran
+\texttt{model.generate} in fp32 (outside any autocast). Wrapping rollouts in
+autocast roughly halved generation cost (Section~\ref{sec:throughput}).
+\end{itemize}
 
 \section{Training Pipeline}
-\paragraph{SFT warmup.} We first behavior-clone a ground-truth expert (the
-safe cell whose flood fill reveals the most, with deterministic row-major
-tie-breaking) on random mid-game states: 600 steps, batch 32--64, lr
-$10^{-5}$, fp16 autocast with gradient scaling. Random tie-breaking was
-intentionally removed: with many equally-good cells, inconsistent targets
-kept the SFT loss above $0.95$ and produced a degenerate greedy policy.
-\paragraph{GRPO.} Each step samples $P{=}12$ fresh boards and $G{=}8$
-completions per board from the current policy (temperature 1.0). Rewards are
-group-normalized,
+
+\subsection{Stage 1: SFT behavior-clone warmup}
+Pure GRPO from a raw pretrained GPT-2 is impractical here: the model must
+first learn the answer format. The warmup clones the expert on fresh random
+mid-game states each step (no dataset, no reuse): 600 steps, batch 32--64,
+AdamW lr $10^{-5}$, weight decay 0.01, grad clip 1.0. Loss trajectory
+(deterministic tie-breaks): $4.65 \to 0.98$ by step 50, $\to 0.87$--$0.90$
+plateau by step 600. The residual plateau is the entropy of the task itself
+(the expert's choice is genuinely uncertain from the visible board alone).
+
+Design choices that mattered:
+\begin{itemize}
+\item \textbf{Deterministic tie-breaks} (Section~\ref{sec:bug-ties}).
+\item \textbf{Position ids matching \texttt{generate}} (Section~\ref{sec:bug-pos}).
+\item \textbf{Fresh states every step}: the state distribution never
+overfits, matching the RL stage's on-policy distribution.
+\end{itemize}
+
+\subsection{Stage 2: GRPO}
+GRPO~\cite{shao2024deepseekmath} replaces the learned critic with a
+group-relative baseline: for each prompt, sample $G$ completions, score them,
+normalize within the group:
 \begin{equation}
-A_i = \frac{r_i - \mathrm{mean}(r_{1..G})}{\mathrm{std}(r_{1..G}) + \epsilon},
+A_{i} \;=\; \frac{r_i - \operatorname{mean}(r_{1\ldots G})}
+                 {\operatorname{std}(r_{1\ldots G}) + \epsilon},
+\qquad \epsilon = 10^{-4}.
+\label{eq:grpo}
 \end{equation}
-and the policy gradient $-\sum_i \sum_t A_i \log \pi_\theta(y_{i,t})$ is
-applied over answer tokens only, with AdamW (lr $10^{-5}$), gradient clipping
-at 1.0, and an optional KL penalty to the frozen reference policy
-($\beta{=}0.05$). Because rollouts and training share the same weights
-in-process, no importance-ratio correction is needed for one inner epoch.
-Updates are microbatched (24 rows) to fit K80 memory alongside co-tenant jobs.
+The policy-gradient loss over answer tokens is
+\begin{equation}
+\mathcal{L}(\theta) \;=\; -\;\frac{1}{\sum_i |y_i|}
+\sum_{i} A_i \sum_{t} \log \pi_\theta(y_{i,t} \mid x_i, y_{i,<t})
+\;+\; \beta\, \widehat{\mathrm{KL}}\big[\pi_\theta \,\|\, \pi_{\mathrm{ref}}\big],
+\end{equation}
+with $\beta = 0.05$ in the stable configurations. We use $P = 12$ prompts
+$\times$ $G = 8$ completions per step (96 rows), temperature 1.0, AdamW lr
+$10^{-5}$, grad clip 1.0. Because rollouts and training use the same weights
+in-process with a single inner epoch, no PPO importance ratio is required;
+the ratio machinery (clipping against detached rollout log-probs) is
+implemented and switches on automatically for $\mu > 1$ inner epochs.
 
-\section{Three Nearly-Silent Failure Modes}
-\subsection{Impure reward across group rollouts}
-The reward function originally computed the flood-fill gain by revealing
-cells \emph{on the shared board}. All $G$ rollouts of a group score the same
-nominal state, so sample $k$'s reward was computed on the board mutated by
-samples $1..k{-}1$: a cell safe for sample 1 scored as a wasted click for
-sample 5. Identical actions received order-dependent rewards, advantages were
-pure noise correlated with sample order, and mean reward sat flat at
-$-0.10$ for hundreds of steps while the trainer appeared healthy. The fix ---
-score every rollout against an untouched probe copy --- was a five-line
-change and immediately moved mean reward from $-0.10$ to $+0.35$ (Figure
-placeholder). \emph{Lesson: reward functions must be pure with respect to
-state when multiple actions are scored against one state; mutation bugs in
-the reward are invisible in the loss curve.}
+The KL estimator is the $k_3$ form, computed on answer-token positions:
+$\mathrm{KL} \approx \pi_\theta/\pi_{\mathrm{ref}} -
+\log(\pi_\theta/\pi_{\mathrm{ref}}) - 1$.
 
-\subsection{Position-id mismatch for padded rows}
-HF \texttt{generate} computes position ids from the attention mask cumsum,
-correctly handling left-padded batches. Our training-side log-prob path did
-not pass position ids, so GPT-2 received \texttt{arange} positions: for every
-row shorter than the batch max, answer tokens sat at shifted positions with a
-gap after the context padding. The policy trained under a distribution shift
-it never saw at inference. Passing
-$\mathrm{pos} = \mathrm{cumsum}(\mathrm{mask}) - 1$ in training (matching
-\texttt{generate}) lifted full-game clearing from $44\%$ to $64\%$ of safe
-cells at equal training budget. \emph{Lesson: any hand-rolled scoring path
-must replicate \texttt{generate}'s position handling exactly.}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Board & $6\times6$, 6 mines (curriculum: $2\to4\to6$) \\
+Prompts per step $P$ & 12 \\
+Group size $G$ & 8 \\
+Rollout temperature & 1.0 (annealing to 0.7 available, unused) \\
+Max new tokens & 6 (was 8; answers need $\sim$4) \\
+Learning rate & $1{\times}10^{-5}$ (3e-5 collapses, Section~\ref{sec:bug-collapse}) \\
+KL coefficient $\beta$ & 0.05 (0.0 is unstable long-run) \\
+Microbatch & 24 rows \\
+Grad clip & 1.0 \\
+Steps & 1500 (checkpoints every 200) \\
+\bottomrule
+\end{tabular}
+\caption{GRPO configuration used by the stable variants.}
+\end{table}
 
-\subsection{Brittle answer parsing}
-The completion is sampled greedily in structure but the model repeats
-patterns: \texttt{2,1,1,4,} with no whitespace. A parser demanding exactly
-two comma-separated integers per whitespace token rejected every completion,
-so all rewards were $-1$, all group variances zero, and all advantages zero:
-GRPO silently became the identity update. Regex-parsing the first
-\texttt{d+,d+} pair fixed it. \emph{Lesson: with verifiable rewards, the
-parser is part of the reward; test it on real model output, not idealized
-strings.}
+\section{The Debugging Record}
+\label{sec:bugs}
+Four distinct defects were found and fixed. Each was found the same way:
+training looked ``flat'' or ``wrong'', and the metric alone could not say
+why. The recurring diagnostic tool was a \emph{single-prompt or single-board
+probe} --- generate for one board, parse, classify the move outcome --- run
+outside the training loop.
 
-We additionally observed fp16 gradient-scaler skips (normal, transient),
-mode collapse without a KL anchor (irreversible within 100 steps at lr
-$3{\times}10^{-5}$), and GPT-2's missing pad token.
+\subsection{Case 1: Brittle parsing silently nullified GRPO}
+\label{sec:bug-parse}
+\textbf{Symptom.} GRPO step-1 log: \texttt{reward -1.0000, mine\_or\_bad
+1.000} --- every one of 96 sampled moves scored $-1$. With all-reward groups
+the variance is zero and by Eq.~\eqref{eq:grpo} every advantage is exactly
+zero: \emph{GRPO became the identity update}. It would have ``trained'' for
+hours doing nothing.
 
-\section{Results}
-\begin{table}[h]
+\textbf{Diagnosis.} Dumped raw completions from a batched rollout: they were
+parseable-looking --- \texttt{'2,1,1,4,'}, \texttt{'5,3,1,1,'}. The original
+parser split on whitespace and required exactly two comma-parts per token;
+these completions are a \emph{single} whitespace-free token with four parts,
+so every one returned \texttt{None}. A one-line reward check confirmed:
+\texttt{\{reward counts: \{-1.0: 32\}\}} for 32 parseable-looking
+completions.
+
+\textbf{Fix.} Regex-first-pair parser (Section~3.4). Re-running the same
+probe gave a healthy reward distribution:
+\begin{lstlisting}[language={}, caption={Reward histogram after the parser fix (32 rollouts).}]
+{-1.0: 6, -0.5: 8, 0.514: 2, 0.515: 1, ..., 0.788: 1}
+\end{lstlisting}
+Six mines, eight wasted clicks, eighteen safe clicks with graded flood-fill
+rewards --- exactly the signal GRPO needs.
+
+\textbf{Lesson.} The parser is part of the reward function. Unit-test it on
+\emph{real} model output, not idealized strings, before trusting any RL
+metric.
+
+\subsection{Case 2: Position-id mismatch between training and inference}
+\label{sec:bug-pos}
+\textbf{Symptom.} SFT converged to a plausible loss ($\sim$0.89) but played
+badly: single-move greedy outcomes over 60 fresh boards were
+\{mine: 11, waste: 0, safe: 49\} --- no better than blind rate --- and
+full-game clearing was 44\% of safe cells with a 0\% win rate.
+
+\textbf{Diagnosis.} HF \texttt{generate} builds position ids from the
+attention mask (\texttt{cumsum(mask) - 1}), correctly handling left-padded
+batches. The hand-rolled training-side log-prob path (and the SFT loss) did
+not pass position ids, so GPT-2 received \texttt{arange} positions. Training
+sequences are right-padded: context tokens occupy positions $0..n-1$ but
+answer tokens sit after the padding, at positions with a \emph{gap}. Every
+row shorter than the batch max --- most rows --- trained under a position
+distribution that never occurs at inference.
+
+\textbf{Fix.}
+\begin{lstlisting}[caption={Position ids for padded rows, matching generate().}]
+attn = (full != PAD_ID).long()
+attn[:, 0] = 1
+position_ids = attn.cumsum(-1) - 1
+position_ids.clamp_(min=0)
+logits = model(input_ids=full, attention_mask=attn,
+               position_ids=position_ids).logits
+\end{lstlisting}
+\textbf{Effect.} Full-game clearing at equal budget: $44\% \to 64\%$; SFT
+loss at step 50 dropped from 0.98 to 0.87.
+
+\textbf{Lesson.} Any hand-rolled scoring path must replicate
+\texttt{generate}'s position handling exactly. The bug is silent: loss
+decreases normally, generation samples normally, play is mediocre.
+
+\subsection{Case 3: An impure reward function poisoned the advantages}
+\label{sec:bug-reward}
+\textbf{Symptom.} The most instructive failure. GRPO (lr $10^{-5}$, temp 1.0)
+ran 500 steps with reward pinned at $-0.10 \pm 0.03$ and bad-move rate
+$0.53$--$0.57$; a lr $3{\times}10^{-5}$ variant degraded to reward $-0.45$,
+bad rate $0.80$. Nothing in the logs distinguished ``bug'' from ``slow
+learning''.
+
+\textbf{Diagnosis, in three probes:}
+\begin{enumerate}
+\item \textbf{Within-group variance probe} (8 prompts $\times$ 8 samples,
+temp 1.0): group reward stds were healthy, $0.44$--$0.77$ --- but the
+\emph{composition} was wrong. A typical group:
+\begin{lstlisting}[language={}]
+[0.84, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5]  std=0.444
+\end{lstlisting}
+Seven of eight samples scoring $-0.5$ (wasted clicks on \emph{already-open}
+cells) could not be right: the same model, generating for a single board one
+prompt at a time, produced \emph{zero} wasted clicks in 60 tries.
+\item \textbf{Batch-size probe}: the waste only appeared in batched
+rollouts, never in single-prompt generation.
+\item \textbf{Code reading with the above lens:} \texttt{step\_reward}
+computed the flood-fill gain by calling \texttt{\_flood} \emph{on the shared
+board}, which mutates \texttt{revealed}. All $G=8$ rollouts of a group score
+the same nominal state, so sample $k$'s reward was computed on the board
+mutated by samples $1..k{-}1$. Identical actions received different rewards
+depending on sample order; early safe clicks turned later copies of the same
+click into ``wasted clicks''. The advantages were not merely noisy --- they
+were \emph{systematically wrong}, with a sign correlated with sample position.
+\end{enumerate}
+
+\textbf{Fix.} Make the reward pure: measure the flood gain on a probe copy of
+the board (the same trick the expert already used).
+\begin{lstlisting}[caption={Pure reward: flood gain measured on a probe copy.}]
+probe = Minesweeper.__new__(Minesweeper)
+probe.w, probe.h, probe.n_mines = board.w, board.h, board.n_mines
+probe.mines = board.mines
+probe.revealed = set(board.revealed)   # copy, not reference
+n = probe._flood(r, c)                 # real board untouched
+return 0.5 + 0.5 * (n / hidden_before), False
+\end{lstlisting}
+
+\textbf{Effect.} Immediate and dramatic. All four variants, within 80 steps:
+\begin{lstlisting}[language={}, caption={First 80 steps after the reward-purity fix.}]
+grpo_a: step  1  reward 0.1768  mine_or_bad 0.281
+grpo_a: step 80  reward 0.3119  mine_or_bad 0.188
+grpo_b: step 80  reward 0.3484  mine_or_bad 0.163
+\end{lstlisting}
+Mean reward: $-0.10 \to +0.35$; bad-move rate: $0.55 \to 0.16$. The policy
+had been \emph{fine} all along --- the reward channel was lying.
+
+\textbf{Lesson.} A reward function that scores multiple actions against one
+state must be pure with respect to that state. This bug is invisible in the
+loss curve, invisible in the reward mean (it just looks ``flat''), and only
+shows up when you examine the \emph{composition} of rewards within a group.
+
+\subsection{Case 4: Mode collapse without a KL anchor}
+\label{sec:bug-collapse}
+\textbf{Symptom.} Two independent runs degraded catastrophically mid-training:
+\begin{lstlisting}[language={}, caption={KL-free run collapsing (lr 3e-5 and 1e-5 alike).}]
+step  40  reward -0.1367  mine_or_bad 0.555
+step 100  reward -0.4515  mine_or_bad 0.801
+\end{lstlisting}
+Bad-move rate $0.55 \to 0.80$: the policy was \emph{actively getting worse},
+converging onto a degenerate mode (repeating a single high-frequency cell,
+mostly wasted clicks).
+
+\textbf{Fix.} KL penalty to the frozen initialization ($\beta = 0.05$, $k_3$
+estimator) at lr $10^{-5}$. Post-fix runs trained for 500+ steps without
+collapse. The KL anchoring costs $\sim$30\% step time (reference forward) and
+is worth it.
+
+\textbf{Lesson.} On-policy GRPO without KL on a small model can destroy its
+own initialization within 100 steps. lr $3{\times}10^{-5}$ collapses even
+with groups of 8; $10^{-5}$ is stable with KL.
+
+\subsection{Case 5: Entropy in the SFT targets}
+\label{sec:bug-ties}
+The original expert broke ties among equally-revealing safe cells at random.
+Because mid-game boards frequently have many such cells, the SFT target for
+a given board is a \emph{distribution}, and the loss floor is high
+($0.95$--$1.07$ vs $0.87$ with deterministic ties). Worse, the greedy policy
+collapsed to \texttt{0,0} (row-major-first bias) and the sampled distribution
+smeared probability across all cells. Deterministic (row-major-first)
+tie-breaks made targets consistent and taught the model to actually read the
+board.
+
+\section{Experiments and Results}
+\label{sec:results}
+
+\subsection{Variants}
+Four concurrent GRPO variants, one per GPU, sharing a single codebase and
+differing only in initialization and stabilization:
+\begin{itemize}
+\item \textbf{grpo\_a}: full SFT (600 steps) init, KL 0.05. (Originally
+KL-free; restarted after the Case-4 collapse.)
+\item \textbf{grpo\_b}: full SFT init (SFT lr $3{\times}10^{-5}$), resumed
+from its step-400 checkpoint with KL added.
+\item \textbf{grpo\_c}: short SFT (150 steps) init, KL 0.05 --- tests how much
+warmup GRPO actually needs.
+\item \textbf{grpo\_d}: full SFT init with a mine-count curriculum
+$2 \to 4 \to 6$ mines at steps $400/400/700$ --- the prompt announces the
+mine count, so easy boards are genuinely easier.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{figs/reward_curves.png}
+\caption{Mean rollout reward per variant (96 samples per point; points are
+20-step log windows, hence the variance). Vertical lines mark curriculum
+stage boundaries for grpo\_d.}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{figs/bad_move_rate.png}
+\caption{Fraction of sampled moves that are mines, wasted clicks, or
+unparseable. The red dashed line marks the pre-fix plateau under the impure
+reward (Case 3) for contrast.}
+\end{figure}
+
+\subsection{Single-move policy quality}
+Single-move outcome probes (60 fresh boards, sampled at temp 1.0) trace the
+policy's actual improvement, disentangled from reward shaping:
+\begin{table}[H]
 \centering
 \small
 \begin{tabular}{lccc}
 \toprule
-Model & Win rate & Cleared fraction & Mean rollout reward \\
+Policy & mine & waste & safe \\
 \midrule
-Random click & $\approx 0$ & $\approx 0.15$ & $\approx 0.35$ (one-move) \\
-SFT warmup (600 steps) & \textbf{TODO} & 0.64 & \textbf{TODO} \\
-GRPO from SFT (KL 0.05) & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} \\
-GRPO, mine-count curriculum 2$\to$4$\to$6 & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} \\
+SFT (600 steps), greedy & 11/60 & 0 & 49/60 \\
+SFT (600 steps), sampled & 16/60 & 0 & 44/60 \\
+GRPO step-200 (pre-reward-fix run) & 8/60 & 2 & 50/60 \\
 \bottomrule
 \end{tabular}
-\caption{Final 30--100 game evaluations. Filled after training completes.}
+\caption{Single-move probes. For calibration: a uniform random click on the
+mid-game state distribution hits a mine $\approx$17--40\% of the time
+depending on how many cells remain hidden.}
 \end{table}
 
-\section{Hardware and Throughput}
-All runs share the machine with unrelated co-tenant jobs. Measured on K80:
-GPT-2 fp16 eager generation at batch 96$\times$90 tokens, SFT $\approx$5\,s/step
-(batch 32), GRPO $\approx$12--17\,s/step (96 rollouts + update), limited by
-co-tenant memory pressure and kernel-launch overhead on the 124M model.
-Rolling out in fp16 autocast rather than fp32 roughly halved generation cost.
+\subsection{Full-game results}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Checkpoint & Win rate & Cleared fraction & Protocol \\
+\midrule
+SFT (600 steps) & 0.00 & 0.64 & T=0.7, 30 games \\
+SFT (150 steps) & 0.00 & 0.41--0.43 & greedy / T=0.7 \\
+GRPO ckpt-200 (curriculum variant) & 0.00 & 0.53 & T=0.7 \\
+GRPO ckpt-400 (curriculum variant) & 0.00 & 0.57 & T=0.7 \\
+GRPO ckpt-400 (curriculum variant) & 0.00 & 0.49 & greedy \\
+Expert (oracle) & 1.00 & 1.00 & 20/20 games \\
+\bottomrule
+\end{tabular}
+\caption{Full-game evaluations to date. Final post-training numbers will be
+filled in when the 1500-step runs complete.}
+\end{table}
 
-\section{Conclusion}
-A 2014 GPU and a 2022 torch build are sufficient to run GRPO on a small LM
-against a verifiable game environment, provided the trainer is written from
-scratch and its assumptions are instrumented. The dominant risks are not
-exotic: they are impure reward functions, position-id mismatches, and brittle
-output parsing --- each invisible in the loss curve and each fixable in
-minutes once observed in rollout diagnostics.
+\paragraph{Why wins are the hard part.}
+Full-game play needs $\sim$15--25 consecutive correct moves. A per-move safe
+probability of $p$ yields a win probability of roughly $p^{20}$: at $p=0.82$
+(SFT init) that is $\approx 2\%$; wins require $p \approx 0.99$, i.e.
+near-elimination of mine clicks and wasted turns at \emph{every} difficulty
+level, including late-game states where visible information is genuinely
+insufficient and any single-forward-pass policy must guess. The dense reward
+(Eq.~\ref{eq:reward}) is aligned with this --- mine clicks cost $-1$ ---
+but the gap from $p=0.85$ to $p=0.99$ is exactly the region where a 124M
+model without chain-of-thought reasoning runs out of representational
+capacity for constraint deduction.
+
+\subsection{Curriculum observations}
+grpo\_d's first stage (2 mines) revealed a transfer gap: on 2-mine boards the
+initial bad-move rate was $0.80$ --- \emph{worse than random} ($\approx
+0.11$) --- despite the policy being decent on 6-mine boards. The prompt
+announces the mine count, and the SFT prior, trained exclusively on 6-mine
+prompts, did not transfer. Adaptation was visible but slow ($0.80 \to 0.34$
+over 120 steps). Curriculum value therefore depends on making the
+\emph{SFT warmup} distribution-matched (e.g.\ mixed mine counts), not just
+the RL stage.
+
+\section{Throughput Engineering}
+\label{sec:throughput}
+Wall-clock per GRPO step (96 rollouts + microbatched update), as measured:
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Configuration & s/step & Notes \\
+\midrule
+GRPO, fp32 rollout, 8 new tokens & 13.6--17.2 & baseline \\
+GRPO, fp16 rollout, 6 new tokens & 12.2--15.3 & on unloaded GPUs \\
+GRPO, co-tenant loaded GPU & 24--29 & GPU-bound, not fixable in software \\
+SFT (batch 32) & 5.0--5.9 & \\
+\bottomrule
+\end{tabular}
+\caption{Step times on K80. fp16 rollout + shorter generations gave
+$\sim$15--20\% on unloaded GPUs; co-tenant contention dominates beyond that.}
+\end{table}
+The lesson: on shared old hardware, the biggest throughput lever is not
+kernel-level optimization but \emph{running the rollout in the same precision
+as training} and keeping sequences short; beyond that, contention with
+co-tenants is the real scheduler.
+
+\section{Operational Playbook for Shared Multi-GPU Boxes}
+\label{sec:ops}
+Everything in this section was learned by hitting it:
+\begin{itemize}
+\item \textbf{\texttt{pkill -f} self-matches.} \texttt{pkill -f
+"grpo.py --init-from sft\_c.pt"} matches the calling shell's own command line
+(which contains the pattern) and kills the wrapper mid-command, so the
+relaunch after it silently never runs. Kill by PID captured from
+\texttt{ps}.
+\item \textbf{\texttt{setsid} forks and returns.} A command chain ending in
+\texttt{setsid nohup ...\ \&\& echo started} prints immediately and the
+background task ``completes'' while the job runs on --- easy to misread as a
+crash (we did, once, in both directions).
+\item \textbf{Shell \texttt{\&} grouping swallows \texttt{cd}.} In
+\texttt{cd dir \&\& cmd1 \& cmd2}, the second command runs in the original
+cwd (the \texttt{cd} happened inside the backgrounded subshell). Use an
+explicit \texttt{cd} per command.
+\item \textbf{Co-tenant memory races.} Free-memory checks at launch go stale;
+four OOM crashes came from co-tenant jobs ballooning after launch. Mitigate
+with small footprints (microbatching), \texttt{max\_split\_size\_mb:128}, and
+staggering restarts.
+\item \textbf{Root filesystem 100\% full}: keep venvs, caches (HF), logs, and
+checkpoints on \texttt{/home}; expect harmless-looking \texttt{pwd: write
+error} noise in every shell.
+\item \textbf{Log cadence:} log reward every 20 steps and save checkpoints
+every 200; the 20-step reward window is noisy ($\pm 0.08$) --- judge trends
+over 100+ steps, and never diagnose from a single log line.
+\end{itemize}
+
+\section{What We Would Do Next}
+\begin{itemize}
+\item \textbf{Chain-of-thought answers.} The single-forward-pass policy caps
+out where deduction is required. A short structured scratchpad
+(``\texttt{2-adjacent cells: ...; safe: r,c}'') with format rewards is the
+standard next step and the most likely to break the $p < 0.99$ barrier.
+\item \textbf{Episode-level GRPO.} Score complete games (win/lose + shaped
+progress) instead of single moves: credit assignment gets harder, but the
+objective aligns exactly with win rate.
+\item \textbf{Distribution-matched SFT} for the curriculum (mixed mine counts
+in the warmup) --- Section~7.4's transfer gap would mostly disappear.
+\item \textbf{Larger board generalization} ($8\times8$, $9\times9$) as the
+real test of whether the policy learned constraint reading or per-board-size
+heuristics.
+\item \textbf{Entropy control:} explicit entropy bonuses/monitoring rather
+than discovering collapse from the reward curve.
+\end{itemize}
+
+\section{Reproduction}
+\begin{lstlisting}[language={}, caption={Full pipeline. Each GRPO variant fits in <6GB.}]
+uv venv --python 3.10 .venv
+uv pip install --python .venv/bin/python torch==1.13.1+cu117 \
+    --index-url https://download.pytorch.org/whl/cu117
+uv pip install --python .venv/bin/python transformers==4.36.2 numpy==1.26.4
+
+CUDA_VISIBLE_DEVICES=<free-gpu> .venv/bin/python sft.py --steps 600 --batch 32
+CUDA_VISIBLE_DEVICES=<free-gpu> .venv/bin/python grpo.py \
+    --init-from sft.pt --steps 1500 --prompts-per-step 12 --group 8 \
+    --lr 1e-5 --temperature 1.0 --kl-coef 0.05 --out-dir runs/grpo
+CUDA_VISIBLE_DEVICES=<free-gpu> .venv/bin/python eval.py \
+    --ckpt runs/grpo/ckpt_1500.pt --games 100 --temperature 0.7
+\end{lstlisting}
+Checkpoints are raw state dicts (\texttt{runs/grpo*/ckpt\_*.pt}); the HF
+upload path is \texttt{export\_hf.py}, which serializes model + tokenizer +
+model card into a \texttt{save\_pretrained} directory.
 
 \begin{thebibliography}{9}
-\bibitem{radford2019gpt2} A.~Radford et al. Language Models are Unsupervised Multitask Learners. 2019.
-\bibitem{shao2024deepseekmath} Z.~Shao et al. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. 2024. (GRPO)
+\bibitem{radford2019gpt2} A.~Radford, J.~Wu, R.~Child, D.~Luan, D.~Amodei,
+I.~Sutskever. \emph{Language Models are Unsupervised Multitask Learners}. 2019.
+\bibitem{shao2024deepseekmath} Z.~Shao et al. \emph{DeepSeekMath: Pushing the
+Limits of Mathematical Reasoning in Open Language Models}. arXiv:2402.03300, 2024.
+(GRPO: group-relative policy optimization.)
+\bibitem{schulman2017ppo} J.~Schulman et al. \emph{Proximal Policy Optimization
+Algorithms}. 2017. (Clipped surrogate; inner-epoch ratio machinery.)
+\bibitem{minesweeper1989} R.~Donner. \emph{Minesweeper}. Microsoft, 1989.
 \end{thebibliography}
+
+\appendix
+
+\section{GRPO update, as implemented}
+\begin{lstlisting}[caption={Microbatched group-relative update (grpo.py, simplified).}]
+adv = compute_advantages(rewards, group)      # eq. (2), per group of 8
+total_mask = ans_attn.sum().detach()
+for chunk in range(0, ctx_ids.shape[0], 24):
+    sl = slice(chunk, chunk + 24)
+    with torch.autocast("cuda", dtype=torch.float16):
+        lp, m = _logprobs(model, ctx_ids[sl], ans_ids[sl])
+    loss = -(adv[sl].unsqueeze(1) * lp * m).sum() / total_mask
+    if ref is not None:                        # k3 KL estimator
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            ref_lp, _ = _logprobs(ref, ctx_ids[sl], ans_ids[sl])
+        kl = (lp.exp() - ref_lp.exp() - (lp - ref_lp)).masked_select(m.bool()).mean()
+        loss = loss + args.kl_coef * kl
+    scaler.scale(loss).backward()
+scaler.unscale_(opt)
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+\end{lstlisting}
+
+\section{Answer-token log-probs with correct positions}
+\begin{lstlisting}[caption={The scoring path that must match generate() (common.py).}]
+def token_logprobs(model, ctx_ids, answer_ids):
+    full = torch.cat([ctx_ids, answer_ids], dim=1)
+    attn = (full != PAD_ID).long(); attn[:, 0] = 1
+    position_ids = attn.cumsum(-1) - 1          # <- the Case-2 fix
+    position_ids.clamp_(min=0)
+    logits = model(input_ids=full, attention_mask=attn,
+                   position_ids=position_ids).logits
+    pos = torch.arange(Lc - 1, Lc + La - 1, device=full.device)
+    logprobs = torch.log_softmax(logits[:, pos, :].float(), dim=-1)
+    ans_lp = torch.gather(logprobs, 2, answer_ids.unsqueeze(-1)).squeeze(-1)
+    return ans_lp, (answer_ids != PAD_ID).float()
+\end{lstlisting}
+
+\section{Timeline}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+Event & Outcome \\
+\midrule
+Env + SFT + GRPO written, venv provisioned & day 0, 1.5h \\
+First end-to-end smoke (3 steps each) & OK \\
+SFT launched (batch 64) & OOM on shared GPU; relaunched smaller \\
+GRPO first launch & OOM in full-batch backward $\to$ microbatching \\
+GRPO ``trained'' 500 steps, flat $-0.10$ & Case 1 (parse) + Case 3 (impure reward) \\
+lr 3e-5 variant & Case 4 (collapse) \\
+Reward purity fix & $-0.10 \to +0.35$ in 80 steps \\
+KL added to all variants & no further collapses \\
+fp16 rollout + 6-token generations & 15--20\% faster steps \\
+Curriculum variant launched & transfer gap identified (Section 7.4) \\
+\bottomrule
+\end{tabular}
+\caption{Chronology of the experiment.}
+\end{table}
 
 \end{document}
