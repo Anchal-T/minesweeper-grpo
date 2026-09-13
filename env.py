@@ -90,7 +90,8 @@ class Minesweeper:
 
 
 def step_reward(board, r, c):
-    """Dense verifiable reward for one move.
+    """Dense verifiable reward for one move (non-mutating: the flood-fill gain
+    is measured on a probe copy so all group rollouts score the same state).
 
     mine / illegal / off-board : -1.0
     safe click                 : 0.5 + 0.5 * (cells revealed / cells hidden before)
@@ -103,7 +104,11 @@ def step_reward(board, r, c):
     if board.is_mine(r, c):
         return -1.0, True
     hidden_before = len(board.hidden_cells())
-    n = board._flood(r, c)
+    probe = Minesweeper.__new__(Minesweeper)
+    probe.w, probe.h, probe.n_mines = board.w, board.h, board.n_mines
+    probe.mines = board.mines
+    probe.revealed = set(board.revealed)
+    n = probe._flood(r, c)
     return 0.5 + 0.5 * (n / hidden_before), False
 
 
