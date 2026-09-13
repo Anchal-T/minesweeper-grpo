@@ -18,9 +18,9 @@ from common import load_tokenizer, load_model, sample_completions, PAD_ID
 from env import Minesweeper, parse_move, step_reward
 
 
-def rollout_batch(model, tok, n_prompts, group, temperature, device, max_new_tokens=8):
+def rollout_batch(model, tok, n_prompts, group, temperature, device, max_new_tokens=8, n_mines=6):
     """Returns prompts, per-sample completions grouped, rewards."""
-    boards = [Minesweeper() for _ in range(n_prompts)]
+    boards = [Minesweeper(n_mines=n_mines) for _ in range(n_prompts)]
     prompts = [b.prompt() for b in boards]
     rep_prompts = [p for p in prompts for _ in range(group)]
     texts, gen_ids = sample_completions(
@@ -65,6 +65,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--temp-end", type=float, default=None,
                     help="linearly anneal rollout temperature to this by the last step")
+    ap.add_argument("--curriculum", default=None,
+                    help="mine-count schedule, e.g. '2:400,4:400,6:' (empty=rest of run)")
     ap.add_argument("--epochs-per-batch", type=int, default=1, help="inner PPO-style epochs (mu>1 needs ratios)")
     ap.add_argument("--kl-coef", type=float, default=0.0)
     ap.add_argument("--clip", type=float, default=0.2)
@@ -107,6 +109,19 @@ def main():
         logf.write(msg + "\n")
         logf.flush()
 
+    # parse curriculum into [(n_mines, until_step), ...]
+    stages = []
+    if args.curriculum:
+        for part in args.curriculum.split(","):
+            m, s = part.split(":")
+            stages.append((int(m), int(s) if s else args.steps + 1))
+
+    def mines_for(step):
+        for m, until in stages:
+            if step <= until:
+                return m
+        return stages[-1][0] if stages else 6
+
     running = {"rew": 0.0, "mine": 0.0, "n": 0}
     t0 = time.time()
     model.train()
@@ -120,7 +135,7 @@ def main():
         with torch.no_grad():
             prompts, boards, texts, gen_ids, rewards, group = rollout_batch(
                 model, tok, args.prompts_per_step, args.group, temp,
-                device, args.max_new_tokens)
+                device, args.max_new_tokens, n_mines=mines_for(step))
             rep_prompts = [p for p in prompts for _ in range(group)]
             ctx_ids, ctx_attn = prompt_token_padded(tok, rep_prompts, device)
             ans_ids, ans_attn = answer_token_padded(tok, texts, device)
@@ -170,7 +185,7 @@ def main():
         if step % 20 == 0 or step == 1:
             n = running["n"]
             log(f"step {step:5d}  reward {running['rew']/n:.4f}  "
-                f"mine_or_bad {running['mine']/n:.3f}  "
+                f"mine_or_bad {running['mine']/n:.3f}  mines {mines_for(step)}  "
                 f"({(time.time()-t0)/step:.2f}s/step)")
             running = {"rew": 0.0, "mine": 0.0, "n": 0}
 
