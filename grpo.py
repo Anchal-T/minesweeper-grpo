@@ -67,6 +67,8 @@ def main():
     ap.add_argument("--kl-coef", type=float, default=0.0)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--max-new-tokens", type=int, default=8)
+    ap.add_argument("--micro-batch", type=int, default=24,
+                    help="rows per forward/backward chunk (memory bound on K80)")
     ap.add_argument("--out-dir", default="runs/grpo")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--eval-every", type=int, default=200)
@@ -124,31 +126,35 @@ def main():
                     roll_lp, roll_mask = lp.detach(), m
         adv = compute_advantages(rewards, group).to(device)
 
-        # ---------- update ----------
+        # ---------- update (microbatched over rows to fit K80 VRAM) ----------
         model.train()
+        total_mask = ans_attn.sum().detach()
         for _ in range(args.epochs_per_batch):
-            with torch.autocast("cuda", dtype=torch.float16):
-                lp, m = _logprobs(model, ctx_ids, ans_ids)
-            per_tok = (adv.unsqueeze(1) * lp) * m
-            pg_loss = -per_tok.sum() / m.sum()
-            loss = pg_loss
-            if args.epochs_per_batch > 1:
-                ratio = torch.exp((lp - roll_lp).clamp(-20, 20))
-                unclipped = ratio * adv.unsqueeze(1)
-                clipped = torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * adv.unsqueeze(1)
-                pg_loss = -(torch.min(unclipped, clipped) * m).sum() / m.sum()
-                loss = pg_loss
-            if ref is not None:
-                with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                    ref_lp, _ = _logprobs(ref, ctx_ids, ans_ids)
-                kl = (lp.exp() - ref_lp.exp() - (lp - ref_lp)).masked_select(m.bool()).mean()
-                loss = loss + args.kl_coef * kl
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            for s in range(0, ctx_ids.shape[0], args.micro_batch):
+                sl = slice(s, s + args.micro_batch)
+                with torch.autocast("cuda", dtype=torch.float16):
+                    lp_s, m_s = _logprobs(model, ctx_ids[sl], ans_ids[sl])
+                adv_s = adv[sl]
+                per_tok = (adv_s.unsqueeze(1) * lp_s) * m_s
+                if args.epochs_per_batch > 1:
+                    ratio = torch.exp((lp_s - roll_lp[sl]).clamp(-20, 20))
+                    unclipped = ratio * adv_s.unsqueeze(1)
+                    clipped = torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * adv_s.unsqueeze(1)
+                    per_tok = torch.min(unclipped, clipped) * m_s
+                # normalize by the full-batch token count so chunk grads sum
+                # to the full-batch loss gradient
+                loss = -per_tok.sum() / total_mask
+                if ref is not None:
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                        ref_lp, _ = _logprobs(ref, ctx_ids[sl], ans_ids[sl])
+                    kl = (lp_s.exp() - ref_lp.exp() - (lp_s - ref_lp)).masked_select(m_s.bool()).mean()
+                    loss = loss + args.kl_coef * kl
+                scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
+            opt.zero_grad(set_to_none=True)
 
         # ---------- logging ----------
         r_t = torch.tensor(rewards)

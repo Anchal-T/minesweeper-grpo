@@ -109,9 +109,10 @@ def step_reward(board, r, c):
 
 def expert_move(board, rng=None):
     """Ground-truth expert: among safe hidden cells, pick the one whose flood
-    fill reveals the most (ties broken at random)."""
-    rng = rng or random
-    best, best_gain = [], -1
+    fill reveals the most. Ties broken deterministically (first in row-major
+    order) so SFT targets are consistent — the model must actually read the
+    board instead of averaging over arbitrary tie choices."""
+    best, best_gain = None, -1
     for (r, c) in board.hidden_cells():
         if board.is_mine(r, c):
             continue
@@ -121,10 +122,8 @@ def expert_move(board, rng=None):
         probe.revealed = set(board.revealed)
         gain = probe._flood(r, c)
         if gain > best_gain:
-            best, best_gain = [(r, c)], gain
-        elif gain == best_gain:
-            best.append((r, c))
-    return rng.choice(best) if best else None
+            best, best_gain = (r, c), gain
+    return best
 
 
 def parse_move(text):
