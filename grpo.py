@@ -113,7 +113,8 @@ def main():
             prompts, boards, texts, gen_ids, rewards, group = rollout_batch(
                 model, tok, args.prompts_per_step, args.group, args.temperature,
                 device, args.max_new_tokens)
-            ctx_ids, ctx_attn = prompt_token_padded(tok, prompts, device)
+            rep_prompts = [p for p in prompts for _ in range(group)]
+            ctx_ids, ctx_attn = prompt_token_padded(tok, rep_prompts, device)
             ans_ids, ans_attn = answer_token_padded(tok, texts, device)
             # rollout log-probs for the ratio (also used when mu>1)
             with torch.autocast("cuda", dtype=torch.float16):

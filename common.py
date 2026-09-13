@@ -12,6 +12,7 @@ PAD_ID = 50256  # eos; we mask pads out of loss/logprob anyway
 
 def load_tokenizer():
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tok.pad_token = tok.eos_token  # gpt2 has no pad token
     return tok
 
 
