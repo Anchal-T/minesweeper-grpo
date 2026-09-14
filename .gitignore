@@ -5,3 +5,4 @@ runs/
 hf-cache/
 *.pt
 hf-cache/
+polls.txt
