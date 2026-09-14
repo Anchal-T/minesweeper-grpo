@@ -649,12 +649,16 @@ total_mask = ans_attn.sum().detach()
 for chunk in range(0, ctx_ids.shape[0], 24):
     sl = slice(chunk, chunk + 24)
     with torch.autocast("cuda", dtype=torch.float16):
-        lp, m = _logprobs(model, ctx_ids[sl], ans_ids[sl])
+        lp, m = _logprobs(model, ctx_ids[sl], ans_ids[sl],
+                          ctx_attn[sl])
     loss = -(adv[sl].unsqueeze(1) * lp * m).sum() / total_mask
     if ref is not None:                        # k3 KL estimator
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            ref_lp, _ = _logprobs(ref, ctx_ids[sl], ans_ids[sl])
-        kl = (lp.exp() - ref_lp.exp() - (lp - ref_lp)).masked_select(m.bool()).mean()
+            ref_lp, _ = _logprobs(ref, ctx_ids[sl], ans_ids[sl],
+                                  ctx_attn[sl])
+        log_ratio = (lp - ref_lp).clamp(-20, 20)
+        kl = (torch.exp(-log_ratio) + log_ratio - 1) * m
+        kl = kl.sum() / total_mask
         loss = loss + args.kl_coef * kl
     scaler.scale(loss).backward()
 scaler.unscale_(opt)
@@ -666,7 +670,9 @@ scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
 \begin{lstlisting}[caption={The scoring path that must match generate() (common.py).}]
 def token_logprobs(model, ctx_ids, answer_ids):
     full = torch.cat([ctx_ids, answer_ids], dim=1)
-    attn = (full != PAD_ID).long(); attn[:, 0] = 1
+    ctx_attn = (ctx_ids != PAD_ID).long()
+    ans_attn = (answer_ids != PAD_ID).long()
+    attn = torch.cat([ctx_attn, ans_attn], dim=1)
     position_ids = attn.cumsum(-1) - 1          # <- the Case-2 fix
     position_ids.clamp_(min=0)
     logits = model(input_ids=full, attention_mask=attn,
