@@ -28,8 +28,14 @@ def encode_prompt(tok, prompt, device):
 
 
 @torch.no_grad()
-def sample_completions(model, tok, prompts, max_new_tokens=8, temperature=1.0, greedy=False):
-    """Batch-sample one completion per prompt. Returns list of strings + token ids."""
+def sample_completions(model, tok, prompts, max_new_tokens=8, temperature=1.0,
+                       greedy=False, return_inputs=False):
+    """Batch-sample one completion per prompt.
+
+    Returns decoded strings and generated token ids. When ``return_inputs`` is
+    true, also returns the exact left-padded input ids and attention mask used
+    by ``generate`` so policy-gradient scoring can reuse that layout.
+    """
     device = next(model.parameters()).device
     old_side = tok.padding_side
     tok.padding_side = "left"
@@ -46,22 +52,27 @@ def sample_completions(model, tok, prompts, max_new_tokens=8, temperature=1.0, g
     out = model.generate(**gen_kwargs)
     gen = out[:, input_ids.shape[1]:]
     texts = tok.batch_decode(gen, skip_special_tokens=True)
+    if return_inputs:
+        return texts, gen, input_ids, attn
     return texts, gen
 
 
 def token_logprobs(model, ctx_ids, answer_ids, attn_mask=None):
     """Log-prob of answer_ids given ctx_ids (single batched sequence each).
 
-    ctx_ids, answer_ids: [B, Lc], [B, La] (right-padded with PAD_ID)
+    ctx_ids, answer_ids: [B, Lc], [B, La] (padded with PAD_ID)
     Returns [B, La] log-probs and the answer attention mask.
     """
     B, Lc = ctx_ids.shape
     La = answer_ids.shape[1]
     full = torch.cat([ctx_ids, answer_ids], dim=1)
-    # right-pad context so all rows align: build attention mask from PAD
-    attn = (full != PAD_ID).long()
-    # force first token of each row attended
-    attn[:, 0] = 1
+    # Reuse the rollout context mask when supplied. This preserves the exact
+    # left-padded layout used by generate(); deriving it from token ids remains
+    # a safe fallback for callers that construct their own batches.
+    ctx_attn = ((ctx_ids != PAD_ID).long() if attn_mask is None
+                else attn_mask.long())
+    ans_attn = (answer_ids != PAD_ID).long()
+    attn = torch.cat([ctx_attn, ans_attn], dim=1)
     # match generate(): position ids must count only real tokens, otherwise
     # answer tokens get shifted positions on shorter-than-max rows
     position_ids = attn.cumsum(-1) - 1

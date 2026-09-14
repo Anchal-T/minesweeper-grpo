@@ -23,9 +23,9 @@ def rollout_batch(model, tok, n_prompts, group, temperature, device, max_new_tok
     boards = [Minesweeper(n_mines=n_mines) for _ in range(n_prompts)]
     prompts = [b.prompt() for b in boards]
     rep_prompts = [p for p in prompts for _ in range(group)]
-    texts, gen_ids = sample_completions(
+    texts, gen_ids, ctx_ids, ctx_attn = sample_completions(
         model, tok, rep_prompts, max_new_tokens=max_new_tokens,
-        temperature=temperature, greedy=False)
+        temperature=temperature, greedy=False, return_inputs=True)
     rewards = []
     for b, text in zip([bb for bb in boards for _ in range(group)], texts):
         mv = parse_move(text)
@@ -34,7 +34,7 @@ def rollout_batch(model, tok, n_prompts, group, temperature, device, max_new_tok
         else:
             r, _ = step_reward(b, *mv)
             rewards.append(r)
-    return prompts, boards, texts, gen_ids, rewards, group
+    return prompts, boards, texts, gen_ids, ctx_ids, ctx_attn, rewards, group
 
 
 def compute_advantages(rewards, group):
@@ -124,7 +124,7 @@ def main():
 
     running = {"rew": 0.0, "mine": 0.0, "n": 0}
     t0 = time.time()
-    model.train()
+    model.eval()
     for step in range(1, args.steps + 1):
         temp = args.temperature
         if args.temp_end is not None:
@@ -133,28 +133,33 @@ def main():
         # ---------- rollout (no grad, fp16 autocast for ~2x faster K80 generation) ----------
         model.eval()
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            prompts, boards, texts, gen_ids, rewards, group = rollout_batch(
+            (prompts, boards, texts, gen_ids, ctx_ids, ctx_attn,
+             rewards, group) = rollout_batch(
                 model, tok, args.prompts_per_step, args.group, temp,
                 device, args.max_new_tokens, n_mines=mines_for(step))
-            rep_prompts = [p for p in prompts for _ in range(group)]
-            ctx_ids, ctx_attn = prompt_token_padded(tok, rep_prompts, device)
-            ans_ids, ans_attn = answer_token_padded(tok, texts, device)
+            # Score the exact token sequence and left-padded context sampled
+            # by generate; decode only for environment reward parsing.
+            ans_ids = gen_ids
+            ans_attn = (ans_ids != PAD_ID).float()
             # rollout log-probs for the ratio (also used when mu>1)
             with torch.autocast("cuda", dtype=torch.float16):
                 roll_lp, roll_mask = None, None
                 if args.epochs_per_batch > 1:
-                    lp, m = _logprobs(model, ctx_ids, ans_ids)
+                    lp, m = _logprobs(model, ctx_ids, ans_ids, ctx_attn)
                     roll_lp, roll_mask = lp.detach(), m
         adv = compute_advantages(rewards, group).to(device)
 
         # ---------- update (microbatched over rows to fit K80 VRAM) ----------
-        model.train()
+        # Keep dropout disabled so the update scores the same deterministic
+        # policy that generated the sampled completions.
+        model.eval()
         total_mask = ans_attn.sum().detach()
         for _ in range(args.epochs_per_batch):
             for s in range(0, ctx_ids.shape[0], args.micro_batch):
                 sl = slice(s, s + args.micro_batch)
                 with torch.autocast("cuda", dtype=torch.float16):
-                    lp_s, m_s = _logprobs(model, ctx_ids[sl], ans_ids[sl])
+                    lp_s, m_s = _logprobs(
+                        model, ctx_ids[sl], ans_ids[sl], ctx_attn[sl])
                 adv_s = adv[sl]
                 per_tok = (adv_s.unsqueeze(1) * lp_s) * m_s
                 if args.epochs_per_batch > 1:
@@ -167,8 +172,13 @@ def main():
                 loss = -per_tok.sum() / total_mask
                 if ref is not None:
                     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                        ref_lp, _ = _logprobs(ref, ctx_ids[sl], ans_ids[sl])
-                    kl = (lp_s.exp() - ref_lp.exp() - (lp_s - ref_lp)).masked_select(m_s.bool()).mean()
+                        ref_lp, _ = _logprobs(
+                            ref, ctx_ids[sl], ans_ids[sl], ctx_attn[sl])
+                    # k3 is a non-negative sampled estimator of
+                    # KL(policy || reference), with samples from policy.
+                    log_ratio = (lp_s - ref_lp).clamp(-20, 20)
+                    kl = ((torch.exp(-log_ratio) + log_ratio - 1.0) * m_s).sum()
+                    kl = kl / total_mask
                     loss = loss + args.kl_coef * kl
                 scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -197,10 +207,10 @@ def main():
     logf.close()
 
 
-def _logprobs(model, ctx_ids, ans_ids):
-    """Token log-probs of answers given right-padded contexts."""
+def _logprobs(model, ctx_ids, ans_ids, ctx_attn=None):
+    """Token log-probs of answers given padded contexts."""
     from common import token_logprobs
-    lp, mask = token_logprobs(model, ctx_ids, ans_ids)
+    lp, mask = token_logprobs(model, ctx_ids, ans_ids, attn_mask=ctx_attn)
     return lp, mask
 
 
