@@ -2,10 +2,14 @@
 import os
 
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(__file__), "hf-cache"))
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import logging as transformers_logging
 from peft import LoraConfig, get_peft_model, PeftModel
+
+transformers_logging.disable_progress_bar()
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 

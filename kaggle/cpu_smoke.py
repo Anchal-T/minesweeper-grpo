@@ -24,16 +24,19 @@ def main():
     device = "cpu"
     out = "runs/cpu-smoke"
     os.makedirs(out, exist_ok=True)
+    stage("SMOKE 1/5 load_tokenizer")
     tok = load_tokenizer(MODEL_NAME)
 
-    stage("SMOKE 1/4 load_model device=cpu")
+    stage("SMOKE 2/5 load_model device=cpu")
+    model_started = time.monotonic()
     model = load_model(device, MODEL_NAME)
+    print(f"[MODEL] loaded seconds={time.monotonic() - model_started:.1f}", flush=True)
     optimizer = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad), lr=1e-4,
         weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda", enabled=False)
 
-    stage("SMOKE 2/4 sft target=posterior batch=1")
+    stage("SMOKE 3/5 sft target=posterior batch=1")
     model.train()
     ctx_ids, ctx_attn, ans_ids, ans_attn = build_batch(
         tok, 1, device, target="posterior")
@@ -46,7 +49,7 @@ def main():
     print(f"[SFT] step=1 loss={sft_loss.item():.4f}", flush=True)
     model.save_pretrained(os.path.join(out, "sft"))
 
-    stage("SMOKE 3/4 grpo reward=posterior prompts=1 group=2")
+    stage("SMOKE 4/5 grpo reward=posterior prompts=1 group=2")
     model.eval()
     _, _, _, answer_ids, ctx_ids, ctx_attn, answer_mask, rewards = (
         rollout_batch(model, tok, n_prompts=1, group=2, temperature=1.0,
@@ -78,7 +81,7 @@ def main():
                     scaler, step=1)
     print(f"[GRPO:posterior] checkpoint_saved path={out}/grpo", flush=True)
 
-    stage("SMOKE 4/4 evaluation games=1 max_moves=1")
+    stage("SMOKE 5/5 evaluation games=1 max_moves=1")
     model.eval()
     board = Minesweeper(seed=0)
     texts, _ = sample_completions(model, tok, [board.prompt()],
