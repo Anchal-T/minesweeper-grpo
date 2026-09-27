@@ -7,6 +7,7 @@ Board is rendered row-major; cells are separated by spaces:
 Coordinates are (row, col), 0-indexed.
 """
 import random
+from math import comb
 
 
 class Minesweeper:
@@ -129,6 +130,113 @@ def expert_move(board, rng=None):
         if gain > best_gain:
             best, best_gain = (r, c), gain
     return best
+
+
+def mine_posterior(board):
+    """Return exact mine probabilities for every hidden cell.
+
+    Hidden layouts are weighted uniformly subject to the revealed clues and
+    total mine count. Frontier assignments are enumerated with constraint
+    bounds; unconstrained cells are accounted for with binomial weights.
+    """
+    hidden = board.hidden_cells()
+    if not hidden:
+        return {}
+    hidden_set = set(hidden)
+    clues = []
+    frontier = set()
+    for r, c in board.revealed:
+        adjacent = [p for p in board._neighbors(r, c) if p in hidden_set]
+        if adjacent:
+            clues.append((adjacent, board.adjacent_mines(r, c)))
+            frontier.update(adjacent)
+
+    frontier = sorted(frontier)
+    interior = sorted(hidden_set - set(frontier))
+    f_index = {cell: i for i, cell in enumerate(frontier)}
+    constraints = [(tuple(f_index[p] for p in cells), required)
+                   for cells, required in clues]
+    touching = [[] for _ in frontier]
+    for ci, (indices, _) in enumerate(constraints):
+        for i in indices:
+            touching[i].append(ci)
+    assigned = [-1] * len(frontier)
+    sums = [0] * len(constraints)
+    remaining = [len(indices) for indices, _ in constraints]
+    ways_by_k = [0] * (len(frontier) + 1)
+    mine_ways_by_cell_k = [[0] * (len(frontier) + 1) for _ in frontier]
+
+    def visit(i, mines):
+        if i == len(frontier):
+            ways_by_k[mines] += 1
+            for j, value in enumerate(assigned):
+                if value:
+                    mine_ways_by_cell_k[j][mines] += 1
+            return
+        for value in (0, 1):
+            valid = True
+            for ci in touching[i]:
+                sums[ci] += value
+                remaining[ci] -= 1
+                target = constraints[ci][1]
+                if sums[ci] > target or sums[ci] + remaining[ci] < target:
+                    valid = False
+            assigned[i] = value
+            if valid:
+                visit(i + 1, mines + value)
+            for ci in touching[i]:
+                sums[ci] -= value
+                remaining[ci] += 1
+
+    visit(0, 0)
+    n_interior = len(interior)
+    total_layouts = 0
+    weighted_frontier = [0] * len(frontier)
+    weighted_interior = 0
+    for k, count in enumerate(ways_by_k):
+        n_remaining = board.n_mines - k
+        if count == 0 or not 0 <= n_remaining <= n_interior:
+            continue
+        weight = comb(n_interior, n_remaining)
+        total_layouts += count * weight
+        weighted_interior += count * comb(n_interior - 1, n_remaining - 1) if n_interior and n_remaining else 0
+        for j in range(len(frontier)):
+            weighted_frontier[j] += mine_ways_by_cell_k[j][k] * weight
+    if total_layouts == 0:
+        raise ValueError("board clues are inconsistent with the configured mine count")
+    probabilities = {cell: weighted_frontier[i] / total_layouts
+                     for i, cell in enumerate(frontier)}
+    if interior:
+        p = weighted_interior / total_layouts
+        probabilities.update({cell: p for cell in interior})
+    return probabilities
+
+
+def posterior_move(board):
+    """Pick a minimum-risk hidden cell, with deterministic reveal tie breaks."""
+    posterior = mine_posterior(board)
+    if not posterior:
+        return None
+    p_min = min(posterior.values())
+    candidates = [cell for cell, p in posterior.items() if abs(p - p_min) < 1e-12]
+    # The safe-move reveal gain is layout dependent. The immediate expected
+    # reveal proxy below prefers cells adjacent to more unrevealed cells.
+    return max(candidates, key=lambda cell: (
+        sum(1 for p in board._neighbors(*cell) if p not in board.revealed),
+        -cell[0], -cell[1]))
+
+
+def posterior_reward(board, r, c, mode="posterior"):
+    """Score a move from the visible state, without consulting hidden mines."""
+    if not (0 <= r < board.h and 0 <= c < board.w):
+        return -1.0
+    if (r, c) in board.revealed:
+        return -0.5
+    posterior = mine_posterior(board)
+    p = posterior[(r, c)]
+    p_min = min(posterior.values())
+    best = float(abs(p - p_min) < 1e-12)
+    return best if mode == "vpr" else best - p
 
 
 def parse_move(text):

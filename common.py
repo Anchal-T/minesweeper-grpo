@@ -1,55 +1,69 @@
-"""Shared model/tokenizer utilities for GPT-2 on torch 1.13 + K80 (fp16 autocast, eager attention)."""
+"""Shared Qwen, tokenizer, sampling, and answer-position scoring helpers."""
 import os
 
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(__file__), "hf-cache"))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, PeftModel
 
-MODEL_NAME = "gpt2"  # 124M params, small enough for K80 RL
-PAD_ID = 50256  # eos; we mask pads out of loss/logprob anyway
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
-def load_tokenizer():
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tok.pad_token = tok.eos_token  # gpt2 has no pad token
+def load_tokenizer(model_name=MODEL_NAME):
+    tok = AutoTokenizer.from_pretrained(model_name)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "right"
     return tok
 
 
-def load_model(device="cuda"):
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-    model.to(device)
-    return model
+def load_model(device="cuda", model_name=MODEL_NAME, adapter=None):
+    kwargs = {"torch_dtype": torch.float16 if str(device).startswith("cuda") else torch.float32}
+    if "Qwen" in model_name:
+        kwargs["attn_implementation"] = "sdpa"
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    if adapter:
+        model = PeftModel.from_pretrained(model, adapter, is_trainable=True)
+    else:
+        config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                            "gate_proj", "up_proj", "down_proj"],
+                            task_type="CAUSAL_LM")
+        model = get_peft_model(model, config)
+    return model.to(device)
+
+
+def format_prompt(tok, prompt):
+    return tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False, add_generation_prompt=True)
 
 
 def encode_prompt(tok, prompt, device):
-    ids = tok(prompt, return_tensors="pt").input_ids
+    ids = tok(format_prompt(tok, prompt), return_tensors="pt").input_ids
     return ids.to(device)
 
 
 @torch.no_grad()
 def sample_completions(model, tok, prompts, max_new_tokens=8, temperature=1.0,
                        greedy=False, return_inputs=False):
-    """Batch-sample one completion per prompt.
-
-    Returns decoded strings and generated token ids. When ``return_inputs`` is
-    true, also returns the exact left-padded input ids and attention mask used
-    by ``generate`` so policy-gradient scoring can reuse that layout.
-    """
+    """Sample one completion per prompt and optionally return rollout inputs."""
     device = next(model.parameters()).device
     old_side = tok.padding_side
     tok.padding_side = "left"
     try:
-        enc = tok(prompts, return_tensors="pt", padding=True).to(device)
+        enc = tok([format_prompt(tok, p) for p in prompts],
+                  return_tensors="pt", padding=True).to(device)
     finally:
         tok.padding_side = old_side
     input_ids, attn = enc.input_ids, enc.attention_mask
-    gen_kwargs = dict(input_ids=input_ids, attention_mask=attn,
-                      max_new_tokens=max_new_tokens, do_sample=not greedy,
-                      pad_token_id=PAD_ID)
+    kwargs = dict(input_ids=input_ids, attention_mask=attn,
+                  max_new_tokens=max_new_tokens, do_sample=not greedy,
+                  pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
     if not greedy:
-        gen_kwargs.update(temperature=temperature, top_k=0, top_p=1.0)
-    out = model.generate(**gen_kwargs)
+        kwargs.update(temperature=temperature, top_k=0, top_p=1.0)
+    out = model.generate(**kwargs)
     gen = out[:, input_ids.shape[1]:]
     texts = tok.batch_decode(gen, skip_special_tokens=True)
     if return_inputs:
@@ -57,31 +71,50 @@ def sample_completions(model, tok, prompts, max_new_tokens=8, temperature=1.0,
     return texts, gen
 
 
-def token_logprobs(model, ctx_ids, answer_ids, attn_mask=None):
-    """Log-prob of answer_ids given ctx_ids (single batched sequence each).
+def _transformer_and_head(model):
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    return base.model, base.lm_head
 
-    ctx_ids, answer_ids: [B, Lc], [B, La] (padded with PAD_ID)
-    Returns [B, La] log-probs and the answer attention mask.
-    """
-    B, Lc = ctx_ids.shape
-    La = answer_ids.shape[1]
-    full = torch.cat([ctx_ids, answer_ids], dim=1)
-    # Reuse the rollout context mask when supplied. This preserves the exact
-    # left-padded layout used by generate(); deriving it from token ids remains
-    # a safe fallback for callers that construct their own batches.
-    ctx_attn = ((ctx_ids != PAD_ID).long() if attn_mask is None
-                else attn_mask.long())
-    ans_attn = (answer_ids != PAD_ID).long()
-    attn = torch.cat([ctx_attn, ans_attn], dim=1)
-    # match generate(): position ids must count only real tokens, otherwise
-    # answer tokens get shifted positions on shorter-than-max rows
+
+def _answer_logits(model, full, attn, answer_start, answer_length):
+    """Run the transformer and project only positions predicting answers."""
+    transformer, lm_head = _transformer_and_head(model)
     position_ids = attn.cumsum(-1) - 1
     position_ids.clamp_(min=0)
-    logits = model(input_ids=full, attention_mask=attn, position_ids=position_ids).logits
-    # predict answer token t from position Lc-1+t
-    pos = torch.arange(Lc - 1, Lc + La - 1, device=full.device)
-    pred_logits = logits[:, pos, :]  # [B, La, V]
-    logprobs = torch.log_softmax(pred_logits.float(), dim=-1)
-    ans_lp = torch.gather(logprobs, 2, answer_ids.clamp_max(50256).unsqueeze(-1)).squeeze(-1)
-    ans_mask = (answer_ids != PAD_ID).float()
-    return ans_lp, ans_mask
+    hidden = transformer(input_ids=full, attention_mask=attn,
+                         position_ids=position_ids).last_hidden_state
+    positions = torch.arange(answer_start - 1,
+                             answer_start + answer_length - 1,
+                             device=full.device)
+    return lm_head(hidden[:, positions, :])
+
+
+def token_logprobs(model, ctx_ids, answer_ids, attn_mask=None, answer_mask=None,
+                   pad_id=None):
+    """Return answer token log-probs, mask, and entropy without full-sequence logits."""
+    _, context_length = ctx_ids.shape
+    answer_length = answer_ids.shape[1]
+    full = torch.cat([ctx_ids, answer_ids], dim=1)
+    pad_id = 0 if pad_id is None else pad_id
+    ctx_attn = (ctx_ids != pad_id).long() if attn_mask is None else attn_mask.long()
+    ans_attn = ((answer_ids != pad_id).long() if answer_mask is None
+                else answer_mask.long())
+    attn = torch.cat([ctx_attn, ans_attn], dim=1)
+    logits = _answer_logits(model, full, attn, context_length, answer_length)
+    log_z = torch.logsumexp(logits.float(), dim=-1)
+    token_logits = torch.gather(logits.float(), -1, answer_ids.unsqueeze(-1)).squeeze(-1)
+    logprobs = token_logits - log_z
+    probs = torch.exp(logits.float() - log_z.unsqueeze(-1))
+    entropy = log_z - (probs * logits.float()).sum(dim=-1)
+    return logprobs, ans_attn.float(), entropy
+
+
+def answer_token_padded(tok, texts, device):
+    enc = tok(texts, return_tensors="pt", padding=True).to(device)
+    return enc.input_ids, enc.attention_mask
+
+
+def prompt_token_padded(tok, prompts, device):
+    enc = tok([format_prompt(tok, p) for p in prompts],
+              return_tensors="pt", padding=True).to(device)
+    return enc.input_ids, enc.attention_mask
