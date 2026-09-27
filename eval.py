@@ -12,6 +12,8 @@ def main():
                     help="LoRA adapter directory, or 'base' for the pretrained model")
     ap.add_argument("--games", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--max-moves", type=int, default=None,
+                    help="optional policy-game move limit for smoke checks")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -37,7 +39,8 @@ def main():
                 continue
             _, hit_mine = boards[i].click(*move)
             moves[i] += 1
-            if not hit_mine and not boards[i].solved() and moves[i] < boards[i].w * boards[i].h:
+            move_limit = args.max_moves or boards[i].w * boards[i].h
+            if not hit_mine and not boards[i].solved() and moves[i] < move_limit:
                 next_active.append(i)
         active = next_active
 
