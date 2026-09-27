@@ -5,8 +5,9 @@ set -euo pipefail
 REPO_URL=${REPO_URL:-https://github.com/Anchal-T/minesweeper-grpo.git}
 WORKDIR=${WORKDIR:-/kaggle/working/minesweeper-grpo}
 PY=${PY:-python}
-SFT_STEPS=${SFT_STEPS:-300}
-GRPO_STEPS=${GRPO_STEPS:-20}
+SFT_STEPS=${SFT_STEPS:-2}
+GRPO_STEPS=${GRPO_STEPS:-2}
+EVAL_GAMES=${EVAL_GAMES:-4}
 BASE_REPO=${HF_REPO_ID:-}
 
 if [ ! -d "$WORKDIR/.git" ]; then
@@ -50,5 +51,5 @@ posterior_pid=$!
 wait "$truth_pid"
 wait "$posterior_pid"
 
-"$PY" eval.py --ckpt runs/truth/last --games 400 --device cuda
-"$PY" eval.py --ckpt runs/posterior/last --games 400 --device cuda
+"$PY" eval.py --ckpt runs/truth/last --games "$EVAL_GAMES" --device cuda
+"$PY" eval.py --ckpt runs/posterior/last --games "$EVAL_GAMES" --device cuda

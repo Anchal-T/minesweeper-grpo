@@ -43,7 +43,8 @@ T4 GPUs, add Kaggle Secrets `HF_TOKEN` and optionally `HF_REPO_ID`, then choose
 GRPO variants on separate GPUs, then reports policy results alongside the
 posterior-greedy solver benchmark on the same seeded boards.
 
-Set `SFT_STEPS` and `GRPO_STEPS` in the notebook before launching. The default
-20 GRPO steps are for the initial smoke run; raise this for a training run.
+Set `SFT_STEPS`, `GRPO_STEPS`, and `EVAL_GAMES` in the notebook before
+launching. Defaults run a short end-to-end smoke check (2 SFT steps, 2 GRPO
+steps per variant, 4 evaluation games); raise them for a training run.
 Use `scripts/pipeline.sh` locally with `PY=/path/to/python` to select the
 Python interpreter.
