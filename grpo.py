@@ -231,18 +231,20 @@ def main():
         mine_total += ((reward_tensor <= -0.99) | (reward_tensor == -0.5)).sum().item()
         sample_total += len(rewards)
         if step % 20 == 0 or step == start_step + 1:
-            log(f"step {step:5d} reward {reward_total/sample_total:.4f} "
-                f"mine_or_bad {mine_total/sample_total:.3f} "
-                f"entropy {entropy_total/total_mask.item():.3f} "
-                f"low_variance_groups {low_groups}/{args.prompts_per_step} "
-                f"mines {mines_for(step)} "
-                f"({(time.monotonic()-started)/max(1,step-start_step):.2f}s/step)")
+            elapsed = time.monotonic() - started
+            rate = elapsed / max(1, step - start_step)
+            log(f"[GRPO:{args.reward}] step={step} "
+                f"mean_reward={reward_total/sample_total:.4f} "
+                f"mine_or_bad={mine_total/sample_total:.3f} "
+                f"entropy={entropy_total/total_mask.item():.3f} "
+                f"low_variance_groups={low_groups}/{args.prompts_per_step} "
+                f"mines={mines_for(step)} seconds_per_step={rate:.2f}")
             reward_total = mine_total = sample_total = 0.0
         should_save = step % args.eval_every == 0 or step == args.steps
         budget_hit = time_budget_expired(started, args.time_budget_min)
         if should_save or budget_hit:
             save_checkpoint(checkpoint_dir, model, opt, scaler, step, args.hub_repo)
-            log(f"saved resumable checkpoint at step {step}")
+            log(f"[GRPO:{args.reward}] checkpoint_saved step={step} path={checkpoint_dir}")
         if budget_hit:
             break
 

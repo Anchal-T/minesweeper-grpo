@@ -96,12 +96,14 @@ def main():
         scaler.step(opt)
         scaler.update()
         if step % 25 == 0 or step == start_step + 1:
-            print(f"step {step:5d}  sft_loss {loss.item():.4f}  "
-                  f"({(time.monotonic()-started)/max(1,step-start_step):.2f}s/step)", flush=True)
+            elapsed = time.monotonic() - started
+            rate = elapsed / max(1, step - start_step)
+            print(f"[SFT] step={step} loss={loss.item():.4f} "
+                  f"seconds_per_step={rate:.2f}", flush=True)
         if step % args.save_every == 0:
             save_checkpoint(args.out, model, opt, scaler, step, args.hub_repo)
         if time_budget_expired(started, args.time_budget_min):
-            print("time budget reached; saving resumable checkpoint", flush=True)
+            print("[SFT] time_budget_reached saving_checkpoint=true", flush=True)
             break
     save_checkpoint(args.out, model, opt, scaler,
                     step if 'step' in locals() else start_step, args.hub_repo)
