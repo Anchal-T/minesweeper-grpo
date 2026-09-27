@@ -3,6 +3,7 @@ import os
 
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(__file__), "hf-cache"))
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
