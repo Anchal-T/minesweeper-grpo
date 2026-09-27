@@ -9,10 +9,7 @@ CPU_SMOKE=${CPU_SMOKE:-0}
 BASE_REPO=${HF_REPO_ID:-}
 
 if [ "$CPU_SMOKE" = "1" ]; then
-  SFT_STEPS=1
-  SFT_BATCH=1
   DEVICE=cpu
-  SMOKE_DIR=runs/cpu-smoke
 else
   SFT_STEPS=${SFT_STEPS:-2}
   GRPO_STEPS=${GRPO_STEPS:-2}
@@ -54,18 +51,8 @@ if [ -n "$BASE_REPO" ]; then
 fi
 
 if [ "$CPU_SMOKE" = "1" ]; then
-  stage "SMOKE 1/3 sft target=posterior device=cpu"
-  "$PY" sft.py --target posterior --steps "$SFT_STEPS" --batch "$SFT_BATCH" \
-    --device "$DEVICE" --out "$SMOKE_DIR/sft" --time-budget-min 8 "${SFT_ARGS[@]}"
-  stage "SMOKE 2/3 grpo reward=posterior device=cpu"
-  "$PY" grpo.py --init-from "$SMOKE_DIR/sft" --reward posterior --adv-norm none \
-    --kl-coef 0.05 --steps 1 --prompts-per-step 1 --group 2 --micro-batch 2 \
-    --device "$DEVICE" --lr 1e-5 --out-dir "$SMOKE_DIR/grpo" --time-budget-min 8 \
-    "${POSTERIOR_ARGS[@]}"
-  stage "SMOKE 3/3 evaluation games=1 max_moves=1"
-  "$PY" eval.py --ckpt "$SMOKE_DIR/grpo/last" --games 1 \
-    --device "$DEVICE" --max-moves 1
-  stage "SMOKE complete"
+  stage "CPU smoke (single model load)"
+  "$PY" kaggle/cpu_smoke.py
   exit 0
 fi
 
