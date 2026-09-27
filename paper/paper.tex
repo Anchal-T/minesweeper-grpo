@@ -122,18 +122,25 @@ r(s, a) \;=\;
 \end{equation}
 where $n_{\text{reveal}}$ is the number of cells revealed by the click
 including flood-fill cascade, and $H(s)$ is the set of hidden cells before the
-click. Safe rewards therefore range in $[0.5, 1.0]$, preferring moves that
-open up the board --- the same quantity the expert optimizes, which keeps the
-SFT warmup and the RL objective aligned.
+click. This is the legacy truth reward: it depends on the sampled hidden
+layout and is noisy for guesses. Posterior mode instead computes the exact
+risk $p_a$ for the chosen cell and uses
+$r_{\mathrm{post}}=\mathbb{1}[p_a=p_{\min}]-p_a$; VPR mode uses only the
+indicator. Both retain $-0.5$ for a wasted click and $-1$ for an invalid
+answer. These rewards depend only on the visible state.
 
 \subsection{Expert policy and SFT targets}
-The expert (used only for the SFT warmup) enumerates hidden cells, knows the
-mine locations, and picks the safe cell whose flood fill reveals the most,
-breaking ties \emph{deterministically} in row-major order. The deterministic
-tie-break matters and is a found bug (Section~\ref{sec:bug-ties}): with
-random tie-breaks, many boards have several equally-optimal targets, the SFT
-loss plateaus around $0.95$--$1.07$ nats/token, and the greedy policy
-degenerates to always answering \texttt{0,0}.
+The earlier GPT-2 warmup used a ground-truth expert: it read hidden mine
+locations and selected the safe cell with the largest flood fill. This leaks
+information unavailable to a policy and is retained only as a comparison.
+New SFT targets use the exact posterior mine probability given the visible
+clues and total mine count. Minimum-risk ties use row-major order; exact
+expected flood-fill tie-breaking would enumerate hundreds of thousands of
+layouts per board.
+Deterministic targets matter (Section~\ref{sec:bug-ties}): with random
+tie-breaks, many boards have several equally-optimal targets, the SFT loss
+plateaus around $0.95$--$1.07$ nats/token, and the greedy policy degenerates
+to always answering \texttt{0,0}.
 
 \subsection{Answer parsing}
 The policy's completion is parsed with a regex that extracts the \emph{first}
@@ -243,10 +250,11 @@ overfits, matching the RL stage's on-policy distribution.
 \subsection{Stage 2: GRPO}
 GRPO~\cite{shao2024deepseekmath} replaces the learned critic with a
 group-relative baseline: for each prompt, sample $G$ completions, score them,
-normalize within the group:
+and normalize within the group using population standard deviation (or leave
+the centered advantages unscaled):
 \begin{equation}
 A_{i} \;=\; \frac{r_i - \operatorname{mean}(r_{1\ldots G})}
-                 {\operatorname{std}(r_{1\ldots G}) + \epsilon},
+                 {\operatorname{std}_{\mathrm{pop}}(r_{1\ldots G}) + \epsilon},
 \qquad \epsilon = 10^{-4}.
 \label{eq:grpo}
 \end{equation}
@@ -263,9 +271,13 @@ in-process with a single inner epoch, no PPO importance ratio is required;
 the ratio machinery (clipping against detached rollout log-probs) is
 implemented and switches on automatically for $\mu > 1$ inner epochs.
 
-The KL estimator is the $k_3$ form, computed on answer-token positions:
-$\mathrm{KL} \approx \pi_\theta/\pi_{\mathrm{ref}} -
-\log(\pi_\theta/\pi_{\mathrm{ref}}) - 1$.
+The $k_3$ value estimator on answer-token positions is
+$e^{-\ell}+\ell-1$, where $\ell=\log\pi_\theta-\log\pi_{\mathrm{ref}}$.
+Its sampled value estimates $\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})$,
+but its expected gradient as a policy loss is the gradient of
+$\mathrm{KL}(\pi_{\mathrm{ref}}\|\pi_\theta)$. The optional $k_2$ loss
+$\frac{1}{2}\ell^2$ has expected gradient of
+$\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})$.
 
 \begin{table}[H]
 \centering
@@ -511,24 +523,25 @@ SFT (150 steps) & 0.00 & 0.41--0.43 & greedy / T=0.7 \\
 GRPO ckpt-200 (curriculum variant) & 0.00 & 0.53 & T=0.7 \\
 GRPO ckpt-400 (curriculum variant) & 0.00 & 0.57 & T=0.7 \\
 GRPO ckpt-400 (curriculum variant) & 0.00 & 0.49 & greedy \\
-Expert (oracle) & 1.00 & 1.00 & 20/20 games \\
+Ground-truth expert (leaks mines) & 1.00 & 1.00 & 20/20 games \\
+Posterior-greedy solver & 0.80 & -- & 400 seeded games \\
 \bottomrule
 \end{tabular}
 \caption{Full-game evaluations to date. Final post-training numbers will be
-filled in when the 1500-step runs complete.}
+filled in when the 1500-step GPT-2 runs complete. The ground-truth expert is
+not an achievable policy ceiling; the posterior-greedy solver's measured
+0.80 win rate is a strong reference, not a proven optimal-policy ceiling.}
 \end{table}
 
 \paragraph{Why wins are the hard part.}
-Full-game play needs $\sim$15--25 consecutive correct moves. A per-move safe
-probability of $p$ yields a win probability of roughly $p^{20}$: at $p=0.82$
-(SFT init) that is $\approx 2\%$; wins require $p \approx 0.99$, i.e.
-near-elimination of mine clicks and wasted turns at \emph{every} difficulty
-level, including late-game states where visible information is genuinely
-insufficient and any single-forward-pass policy must guess. The dense reward
-(Eq.~\ref{eq:reward}) is aligned with this --- mine clicks cost $-1$ ---
-but the gap from $p=0.85$ to $p=0.99$ is exactly the region where a 124M
-model without chain-of-thought reasoning runs out of representational
-capacity for constraint deduction.
+The measured trajectory has about 11.3 decision states per game, not 15--25.
+The exact posterior probabilities show a provably safe cell in 84.1\% of states;
+the remaining 15.9\% are forced guesses with mean minimum mine risk 0.131.
+That is about 1.8 forced guesses per game, giving a rough sanity-check estimate of
+$(1-0.131)^{1.8} \approx 0.78$, consistent with the observed 0.80 win rate
+over 400 games. A $p^{20}$ estimate and a required per-move $p\approx0.99$
+therefore misstate this task: some moves have irreducible risk, and the
+ground-truth expert's 1.00 result comes from seeing hidden mines.
 
 \subsection{Curriculum observations}
 grpo\_d's first stage (2 mines) revealed a transfer gap: on 2-mine boards the

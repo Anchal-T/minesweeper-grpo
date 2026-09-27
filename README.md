@@ -1,53 +1,49 @@
-# minesweeper-grpo
+# Minesweeper GRPO on Qwen
 
-GRPO-tune a small LLM (GPT-2 124M) to specialize in solving minesweeper.
-Everything runs locally on the K80 box (torch 1.13.1+cu117, fp16 autocast,
-eager attention — no TRL / vLLM / torch 2.x possible on sm_37).
+Train a Qwen2.5-0.5B-Instruct policy to select moves on procedurally
+generated Minesweeper boards. The pipeline uses LoRA, posterior-oracle SFT,
+and single-move GRPO rewards. Checkpoints include the adapter, optimizer,
+gradient scaler, step, and RNG state, with optional private Hugging Face Hub
+sync through `HF_TOKEN` and `HF_REPO_ID`.
 
-## Setup
+## Install
 
-```bash
-uv venv --python 3.10 .venv
-uv pip install --python .venv/bin/python torch==1.13.1+cu117 \
-    --index-url https://download.pytorch.org/whl/cu117
-uv pip install --python .venv/bin/python transformers==4.36.2 numpy==1.26.4
-```
-
-First run downloads GPT-2 into `hf-cache/` (~500 MB).
-
-## Task
-
-Board text state (6x6, 6 mines):
-
-```
-Minesweeper 6x6 grid, 6 mines. '.' = hidden, digit = adjacent mines.
-1 . . 0 0 1
-...
-Which hidden cell is safe? Answer with row,col (0-indexed). Answer:
-```
-
-Model completes `r,c`. Verifiable rewards (env.py `step_reward`):
-mine / off-board / unparseable = **-1.0**, wasted click on open cell = **-0.5**,
-safe click = **0.5 + 0.5 × (cells revealed by flood fill)** — dense signal that
-prefers informative safe moves.
-
-## Pipeline
-
-1. **SFT warmup** (`sft.py`): behavior-clone the ground-truth expert (safe cell
-   with max flood-fill reveal) on random mid-game states. Gives the policy the
-   output format + basic play so GRPO explores meaningfully instead of from noise.
-2. **GRPO** (`grpo.py`): group-relative advantages (G=8 samples per state),
-   policy gradient on answer tokens; PPO-style clipping and a KL-to-reference
-   option are included for multi-epoch updates.
-3. **Eval** (`eval.py`): greedy full-game play, win rate + cleared fraction.
-
-## Run
+Use a recent PyTorch with CUDA support, then install:
 
 ```bash
-.venv/bin/python sft.py --steps 1500          # ~30 min on one K80
-.venv/bin/python eval.py --ckpt sft.pt
-.venv/bin/python grpo.py --init-from sft.pt --steps 3000
-.venv/bin/python eval.py --ckpt runs/grpo/ckpt_3000.pt
+python -m pip install transformers peft huggingface_hub
 ```
 
-Pick the freest GPU with `CUDA_VISIBLE_DEVICES=<n>`; box is shared (see nvidia-smi).
+The base model defaults to `Qwen/Qwen2.5-0.5B-Instruct`. The tokenizer chat
+template formats board prompts; completions are `row,column`.
+
+## Train
+
+```bash
+python sft.py --target posterior --steps 400 --out runs/sft/last
+python grpo.py --init-from runs/sft/last --reward posterior \
+  --adv-norm none --kl-coef 0.05 --steps 1000 --out-dir runs/grpo
+python eval.py --ckpt runs/grpo/last --games 400
+```
+
+Use `--resume` to restore the latest local checkpoint or download it from the
+Hub when `--hub-repo` (or `HF_REPO_ID`) is set. `--time-budget-min` saves a
+resumable checkpoint before exiting. GRPO supports `--reward truth|posterior|vpr`,
+`--adv-norm std|none`, and `--kl-est k3|k2`. For the optional rationale
+format, use `sft.py --answer-format cot` followed by GRPO with
+`--answer-format cot --prompt-mean-loss --max-new-tokens 160`; set
+`--format-reward` to reward the required `<think>...</think> Answer: r,c`
+structure.
+
+## Kaggle T4x2
+
+Open [kaggle/minesweeper_grpo.ipynb](kaggle/minesweeper_grpo.ipynb), enable two
+T4 GPUs, add Kaggle Secrets `HF_TOKEN` and optionally `HF_REPO_ID`, then choose
+**Save & Run All**. The launcher runs posterior-target SFT, truth and posterior
+GRPO variants on separate GPUs, then reports policy results alongside the
+posterior-greedy solver benchmark on the same seeded boards.
+
+Set `SFT_STEPS` and `GRPO_STEPS` in the notebook before launching. The default
+20 GRPO steps are for the initial smoke run; raise this for a training run.
+Use `scripts/pipeline.sh` locally with `PY=/path/to/python` to select the
+Python interpreter.

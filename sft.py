@@ -8,18 +8,33 @@ import torch
 from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
 from common import MODEL_NAME, format_prompt, load_model, load_tokenizer
-from env import Minesweeper, expert_move, posterior_move
+from env import Minesweeper, expert_move, mine_posterior, posterior_move
 
 
-def build_batch(tok, n, device, target):
+def build_batch(tok, n, device, target, answer_format="move"):
     prompts, answers = [], []
     for _ in range(n):
         board = Minesweeper()
         move = posterior_move(board) if target == "posterior" else expert_move(board)
         if move is not None:
             prompts.append(format_prompt(tok, board.prompt()))
-            answers.append(f"{move[0]},{move[1]}")
-    ctx = tok(prompts, return_tensors="pt", padding=True).to(device)
+            answer = f"{move[0]},{move[1]}"
+            if answer_format == "cot":
+                p_min = min(mine_posterior(board).values())
+                if p_min == 0:
+                    rationale = "The posterior proves this move is safe; its mine probability is 0."
+                else:
+                    rationale = (f"No safe deduction; the lowest risk is p={p_min:.2f} "
+                                 f"at {move[0]},{move[1]}.")
+                answer = f"<think>{rationale}</think> Answer: {answer}"
+            answers.append(answer)
+    old_side = tok.padding_side
+    tok.padding_side = "left"
+    try:
+        ctx = tok(prompts, return_tensors="pt", padding=True,
+                  add_special_tokens=False).to(device)
+    finally:
+        tok.padding_side = old_side
     ans = tok(answers, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
     eos = torch.full((ans.input_ids.shape[0], 1), tok.eos_token_id,
                      dtype=ans.input_ids.dtype, device=device)
@@ -40,6 +55,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL_NAME)
     ap.add_argument("--target", choices=["expert", "posterior"], default="posterior")
+    ap.add_argument("--answer-format", choices=["move", "cot"], default="move")
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -50,6 +66,8 @@ def main():
     ap.add_argument("--time-budget-min", type=float, default=690)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+    if args.answer_format == "cot" and args.target != "posterior":
+        ap.error("CoT targets are generated from the posterior oracle")
 
     if args.resume:
         restore_from_hub(args.out, args.hub_repo)
@@ -66,7 +84,7 @@ def main():
     model.train()
     for step in range(start_step + 1, args.steps + 1):
         ctx_ids, ctx_attn, ans_ids, ans_attn = build_batch(
-            tok, args.batch, args.device, args.target)
+            tok, args.batch, args.device, args.target, args.answer_format)
         with torch.autocast("cuda", dtype=torch.float16,
                             enabled=args.device.startswith("cuda")):
             loss = loss_on_batch(model, ctx_ids, ctx_attn, ans_ids, ans_attn,

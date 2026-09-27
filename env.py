@@ -213,26 +213,24 @@ def mine_posterior(board):
 
 
 def posterior_move(board):
-    """Pick a minimum-risk hidden cell, with deterministic reveal tie breaks."""
+    """Pick a minimum-risk hidden cell, breaking ties in row-major order."""
     posterior = mine_posterior(board)
     if not posterior:
         return None
     p_min = min(posterior.values())
     candidates = [cell for cell, p in posterior.items() if abs(p - p_min) < 1e-12]
-    # The safe-move reveal gain is layout dependent. The immediate expected
-    # reveal proxy below prefers cells adjacent to more unrevealed cells.
-    return max(candidates, key=lambda cell: (
-        sum(1 for p in board._neighbors(*cell) if p not in board.revealed),
-        -cell[0], -cell[1]))
+    # Exact expected flood-fill gain would enumerate hundreds of thousands of
+    # full layouts on common boards; keep target selection inexpensive.
+    return min(candidates)
 
 
-def posterior_reward(board, r, c, mode="posterior"):
+def posterior_reward(board, r, c, mode="posterior", posterior=None):
     """Score a move from the visible state, without consulting hidden mines."""
     if not (0 <= r < board.h and 0 <= c < board.w):
         return -1.0
     if (r, c) in board.revealed:
         return -0.5
-    posterior = mine_posterior(board)
+    posterior = mine_posterior(board) if posterior is None else posterior
     p = posterior[(r, c)]
     p_min = min(posterior.values())
     best = float(abs(p - p_min) < 1e-12)

@@ -1,0 +1,54 @@
+#!/bin/bash
+# Kaggle T4x2 phase-1 run: shared posterior SFT, then truth/posterior GRPO A/B.
+set -euo pipefail
+
+REPO_URL=${REPO_URL:-https://github.com/Anchal-T/minesweeper-grpo.git}
+WORKDIR=${WORKDIR:-/kaggle/working/minesweeper-grpo}
+PY=${PY:-python}
+SFT_STEPS=${SFT_STEPS:-300}
+GRPO_STEPS=${GRPO_STEPS:-20}
+BASE_REPO=${HF_REPO_ID:-}
+
+if [ ! -d "$WORKDIR/.git" ]; then
+  git clone "$REPO_URL" "$WORKDIR"
+else
+  git -C "$WORKDIR" pull --ff-only
+fi
+cd "$WORKDIR"
+"$PY" -m pip install -q peft transformers huggingface_hub
+mkdir -p logs runs
+
+if [ -z "${HF_TOKEN:-}" ] && [ -f /kaggle/working/.hf-token ]; then
+  HF_TOKEN=$(cat /kaggle/working/.hf-token)
+  export HF_TOKEN
+fi
+
+SFT_ARGS=()
+if [ -n "$BASE_REPO" ]; then
+  SFT_ARGS+=(--hub-repo "${BASE_REPO}-sft")
+fi
+CUDA_VISIBLE_DEVICES=0 "$PY" sft.py --target posterior --steps "$SFT_STEPS" \
+  --out runs/sft/last --resume --time-budget-min 690 "${SFT_ARGS[@]}"
+
+TRUTH_ARGS=()
+POSTERIOR_ARGS=()
+if [ -n "$BASE_REPO" ]; then
+  TRUTH_ARGS+=(--hub-repo "${BASE_REPO}-truth")
+  POSTERIOR_ARGS+=(--hub-repo "${BASE_REPO}-posterior")
+fi
+
+CUDA_VISIBLE_DEVICES=0 "$PY" grpo.py --init-from runs/sft/last --reward truth \
+  --adv-norm none --kl-coef 0.05 --steps "$GRPO_STEPS" \
+  --prompts-per-step 16 --group 8 --lr 1e-5 --out-dir runs/truth \
+  --resume --time-budget-min 690 "${TRUTH_ARGS[@]}" > logs/truth.log 2>&1 &
+truth_pid=$!
+CUDA_VISIBLE_DEVICES=1 "$PY" grpo.py --init-from runs/sft/last --reward posterior \
+  --adv-norm none --kl-coef 0.05 --steps "$GRPO_STEPS" \
+  --prompts-per-step 16 --group 8 --lr 1e-5 --out-dir runs/posterior \
+  --resume --time-budget-min 690 "${POSTERIOR_ARGS[@]}" > logs/posterior.log 2>&1 &
+posterior_pid=$!
+wait "$truth_pid"
+wait "$posterior_pid"
+
+"$PY" eval.py --ckpt runs/truth/last --games 400 --device cuda
+"$PY" eval.py --ckpt runs/posterior/last --games 400 --device cuda

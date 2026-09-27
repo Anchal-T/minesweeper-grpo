@@ -41,7 +41,8 @@ def format_prompt(tok, prompt):
 
 
 def encode_prompt(tok, prompt, device):
-    ids = tok(format_prompt(tok, prompt), return_tensors="pt").input_ids
+    ids = tok(format_prompt(tok, prompt), return_tensors="pt",
+              add_special_tokens=False).input_ids
     return ids.to(device)
 
 
@@ -54,7 +55,8 @@ def sample_completions(model, tok, prompts, max_new_tokens=8, temperature=1.0,
     tok.padding_side = "left"
     try:
         enc = tok([format_prompt(tok, p) for p in prompts],
-                  return_tensors="pt", padding=True).to(device)
+                  return_tensors="pt", padding=True,
+                  add_special_tokens=False).to(device)
     finally:
         tok.padding_side = old_side
     input_ids, attn = enc.input_ids, enc.attention_mask
@@ -82,7 +84,7 @@ def _answer_logits(model, full, attn, answer_start, answer_length):
     position_ids = attn.cumsum(-1) - 1
     position_ids.clamp_(min=0)
     hidden = transformer(input_ids=full, attention_mask=attn,
-                         position_ids=position_ids).last_hidden_state
+                         position_ids=position_ids, use_cache=False).last_hidden_state
     positions = torch.arange(answer_start - 1,
                              answer_start + answer_length - 1,
                              device=full.device)
@@ -116,5 +118,6 @@ def answer_token_padded(tok, texts, device):
 
 def prompt_token_padded(tok, prompts, device):
     enc = tok([format_prompt(tok, p) for p in prompts],
-              return_tensors="pt", padding=True).to(device)
+              return_tensors="pt", padding=True,
+              add_special_tokens=False).to(device)
     return enc.input_ids, enc.attention_mask

@@ -1,11 +1,11 @@
 #!/bin/bash
 # GPU pipelines: each GPU runs SFT (if any) then GRPO, chained.
-# Usage: nohup bash scripts/pipeline.sh <gpu> <sft_steps> <sft_lr> <sft_out> <tag> <grpo_lr> <grpo_temp> [init_ckpt|gpt2] [sft_batch]
+# Usage: nohup bash scripts/pipeline.sh <gpu> <sft_steps> <sft_lr> <sft_out> <tag> <grpo_lr> <grpo_temp> [init_adapter|base] [sft_batch]
 set -e
 cd "$(dirname "$0")/.."
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-GPU=$1; SFT_STEPS=$2; SFT_LR=$3; SFT_OUT=$4; TAG=$5; GRPO_LR=$6; TEMP=$7; INIT=${8:-gpt2}; BATCH=${9:-32}
-PY=.venv/bin/python
+GPU=$1; SFT_STEPS=$2; SFT_LR=$3; SFT_OUT=$4; TAG=$5; GRPO_LR=$6; TEMP=$7; INIT=${8:-base}; BATCH=${9:-32}
+PY=${PY:-.venv/bin/python}
 
 if [ "$SFT_STEPS" != "0" ]; then
   CUDA_VISIBLE_DEVICES=$GPU $PY sft.py --steps $SFT_STEPS --batch $BATCH --lr $SFT_LR --out $SFT_OUT >> logs/sft_$TAG.log 2>&1
