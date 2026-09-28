@@ -8,20 +8,24 @@ import torch
 
 from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
-from common import (MODEL_NAME, load_model, load_tokenizer, sample_completions,
-                    token_logprobs)
+from common import (MODEL_NAME, load_model, load_tokenizer, prompt_token_padded,
+                    sample_completions, token_logprobs)
 from env import Minesweeper, parse_move, posterior_reward, step_reward
 
 
 def rollout_batch(model, tok, n_prompts, group, temperature, device,
                   max_new_tokens=6, n_mines=6, reward_mode="truth",
-                  answer_format="move", format_reward=0.0):
+                  answer_format="move", format_reward=0.0, phase_times=None):
     boards = [Minesweeper(n_mines=n_mines) for _ in range(n_prompts)]
     prompts = [b.prompt() for b in boards]
     rep_prompts = [p for p in prompts for _ in range(group)]
+    generation_started = time.perf_counter() if phase_times is not None else 0.0
     texts, gen_ids, ctx_ids, ctx_attn = sample_completions(
         model, tok, rep_prompts, max_new_tokens=max_new_tokens,
         temperature=temperature, greedy=False, return_inputs=True)
+    if phase_times is not None:
+        phase_times["generation"] = time.perf_counter() - generation_started
+    reward_started = time.perf_counter() if phase_times is not None else 0.0
     rewards, masks = [], []
     posteriors = [None] * len(boards)
     for row, (board, text, generated) in enumerate(zip(
@@ -49,6 +53,8 @@ def rollout_batch(model, tok, n_prompts, group, temperature, device,
             rewards.append(reward)
             masks.append(_completion_mask(tok, text, generated, match.end()))
     answer_mask = torch.stack(masks).to(device)
+    if phase_times is not None:
+        phase_times["reward"] = time.perf_counter() - reward_started
     return prompts, boards, texts, gen_ids, ctx_ids, ctx_attn, answer_mask, rewards
 
 
@@ -107,15 +113,41 @@ def main():
     ap.add_argument("--time-budget-min", type=float, default=690)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--eval-every", type=int, default=100)
+    ap.add_argument("--profile-phases", action="store_true",
+                    help="report rollout, reward, policy, reference, and save timings")
     args = ap.parse_args()
     if args.answer_format == "cot" and args.reward == "truth":
         ap.error("CoT phase 2 uses posterior or vpr rewards, not truth reward")
     if args.max_new_tokens is None:
         args.max_new_tokens = 160 if args.answer_format == "cot" else 6
 
+    if args.profile_phases and args.device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            ap.error("phase profiling requested but CUDA is unavailable")
+        total_memory = torch.cuda.get_device_properties(args.device).total_memory
+        print(f"[PROBE] gpu={torch.cuda.get_device_name(args.device)} "
+              f"capability={torch.cuda.get_device_capability(args.device)} "
+              f"compiled_arches={torch.cuda.get_arch_list()} "
+              f"total_memory_gib={total_memory / (1024 ** 3):.2f}", flush=True)
+        product = None
+        try:
+            matrix = torch.empty((1024, 1024), device=args.device)
+            torch.cuda.synchronize(args.device)
+            matmul_started = time.perf_counter()
+            product = matrix @ matrix
+            torch.cuda.synchronize(args.device)
+            print(f"[PROBE] float32_matmul_ms="
+                  f"{1000 * (time.perf_counter() - matmul_started):.2f}",
+                  flush=True)
+            del matrix, product
+        except RuntimeError as error:
+            print(f"[PROBE] float32_matmul=FAILED error={error}", flush=True)
+            raise
+
     checkpoint_dir = os.path.join(args.out_dir, "last")
     if args.resume:
         restore_from_hub(checkpoint_dir, args.hub_repo)
+    initialization_started = time.monotonic()
     tok = load_tokenizer(args.model)
     adapter = checkpoint_dir if args.resume and os.path.exists(
         os.path.join(checkpoint_dir, "adapter_config.json")) else (
@@ -129,11 +161,22 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, "log.txt")
     started = time.monotonic()
+    budget_started = initialization_started if args.profile_phases else started
 
     def log(msg):
         print(msg, flush=True)
         with open(log_path, "a") as f:
             f.write(msg + "\n")
+
+    if args.profile_phases:
+        _, prompt_mask = prompt_token_padded(
+            tok, [Minesweeper().prompt()], args.device)
+        log(f"[PROBE] prompt_tokens={prompt_mask.sum().item():.0f} "
+            f"tokenizer={args.model}")
+        log(f"[PROBE] initialization_seconds="
+            f"{time.monotonic() - initialization_started:.1f}")
+        if args.device.startswith("cuda"):
+            torch.cuda.reset_peak_memory_stats(args.device)
 
     stages = []
     if args.curriculum:
@@ -148,6 +191,10 @@ def main():
         return stages[-1][0] if stages else 6
 
     reward_total = mine_total = sample_total = 0.0
+    phase_totals = {name: 0.0 for name in
+                    ("rollout", "generation", "reward", "policy", "ref", "save")}
+    profiled_steps = profiled_groups = low_variance_groups = 0
+    prompt_token_total = 0.0
     model.eval()  # Keep LoRA dropout disabled so scoring matches rollout policy.
     for step in range(start_step + 1, args.steps + 1):
         temperature = args.temperature
@@ -155,19 +202,33 @@ def main():
             fraction = min(1.0, (step - 1) / max(1, args.steps - 1))
             temperature += fraction * (args.temp_end - args.temperature)
         model.eval()
+        if args.profile_phases and args.device.startswith("cuda"):
+            torch.cuda.synchronize(args.device)
+        rollout_started = time.perf_counter()
+        rollout_times = {} if args.profile_phases else None
         with torch.no_grad(), torch.autocast(
                 "cuda", dtype=torch.float16, enabled=args.device.startswith("cuda")):
-            (_, _, texts, answer_ids, ctx_ids, ctx_attn, answer_mask, rewards) = rollout_batch(
+            (_, _, _, answer_ids, ctx_ids, ctx_attn, answer_mask, rewards) = rollout_batch(
                 model, tok, args.prompts_per_step, args.group, temperature,
                 args.device, args.max_new_tokens, n_mines=mines_for(step),
                 reward_mode=args.reward, answer_format=args.answer_format,
-                format_reward=args.format_reward)
+                format_reward=args.format_reward, phase_times=rollout_times)
             roll_lp = None
             if args.epochs_per_batch > 1:
                 roll_lp, _, _ = token_logprobs(
                     model, ctx_ids, answer_ids, attn_mask=ctx_attn,
                     answer_mask=answer_mask, pad_id=tok.pad_token_id)
                 roll_lp = roll_lp.detach()
+        if args.profile_phases:
+            assert rollout_times is not None
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize(args.device)
+            phase_totals["rollout"] += time.perf_counter() - rollout_started
+            phase_totals["generation"] += rollout_times["generation"]
+            phase_totals["reward"] += rollout_times["reward"]
+            prompt_token_total += ctx_attn.sum().item() / ctx_attn.shape[0]
+            profiled_steps += 1
+            profiled_groups += args.prompts_per_step
         advantages, low_groups = compute_advantages(
             rewards, args.group, args.adv_norm, args.min_group_std)
         advantages = advantages.to(args.device)
@@ -177,6 +238,10 @@ def main():
         entropy_total = 0.0
         model.eval()
         for _ in range(args.epochs_per_batch):
+            if args.profile_phases and args.device.startswith("cuda"):
+                torch.cuda.synchronize(args.device)
+            policy_started = time.perf_counter() if args.profile_phases else 0.0
+            ref_seconds = 0.0
             for offset in range(0, ctx_ids.shape[0], args.micro_batch):
                 sl = slice(offset, offset + args.micro_batch)
                 with torch.autocast("cuda", dtype=torch.float16,
@@ -201,6 +266,9 @@ def main():
                         loss = -(policy_terms * mask).sum() / total_mask
                     entropy_total += float((entropy.detach() * mask).sum())
                     if args.kl_coef > 0:
+                        if args.profile_phases and args.device.startswith("cuda"):
+                            torch.cuda.synchronize(args.device)
+                        ref_started = time.perf_counter() if args.profile_phases else 0.0
                         with torch.no_grad(), model.disable_adapter(), torch.autocast(
                                 "cuda", dtype=torch.float16,
                                 enabled=args.device.startswith("cuda")):
@@ -208,6 +276,12 @@ def main():
                                 model, ctx_ids[sl], answer_ids[sl],
                                 attn_mask=ctx_attn[sl], answer_mask=answer_mask[sl],
                                 pad_id=tok.pad_token_id)
+                        if args.profile_phases:
+                            if args.device.startswith("cuda"):
+                                torch.cuda.synchronize(args.device)
+                            ref_elapsed = time.perf_counter() - ref_started
+                            ref_seconds += ref_elapsed
+                            phase_totals["ref"] += ref_elapsed
                         log_ratio = (lp - ref_lp).clamp(-20, 20)
                         if args.kl_est == "k2":
                             kl_tokens = 0.5 * log_ratio.square()
@@ -225,7 +299,14 @@ def main():
             scaler.step(opt)
             scaler.update()
             opt.zero_grad(set_to_none=True)
+            if args.profile_phases:
+                if args.device.startswith("cuda"):
+                    torch.cuda.synchronize(args.device)
+                phase_totals["policy"] += max(
+                    0.0, time.perf_counter() - policy_started - ref_seconds)
 
+        if args.profile_phases:
+            low_variance_groups += low_groups
         reward_tensor = torch.tensor(rewards)
         reward_total += reward_tensor.mean().item() * len(rewards)
         mine_total += ((reward_tensor <= -0.99) | (reward_tensor == -0.5)).sum().item()
@@ -241,12 +322,37 @@ def main():
                 f"mines={mines_for(step)} seconds_per_step={rate:.2f}")
             reward_total = mine_total = sample_total = 0.0
         should_save = step % args.eval_every == 0 or step == args.steps
-        budget_hit = time_budget_expired(started, args.time_budget_min)
+        budget_hit = time_budget_expired(budget_started, args.time_budget_min)
         if should_save or budget_hit:
+            if args.profile_phases and args.device.startswith("cuda"):
+                torch.cuda.synchronize(args.device)
+            save_started = time.perf_counter()
             save_checkpoint(checkpoint_dir, model, opt, scaler, step, args.hub_repo)
+            if args.profile_phases:
+                if args.device.startswith("cuda"):
+                    torch.cuda.synchronize(args.device)
+                phase_totals["save"] += time.perf_counter() - save_started
             log(f"[GRPO:{args.reward}] checkpoint_saved step={step} path={checkpoint_dir}")
         if budget_hit:
             break
+
+    if args.profile_phases:
+        denominator = max(1, profiled_steps)
+        phase_summary = " ".join(
+            f"{name}={phase_totals[name] / denominator:.2f}s"
+            for name in ("rollout", "generation", "reward", "policy", "ref", "save"))
+        log(f"[PROFILE] steps={profiled_steps} mean_prompt_tokens="
+            f"{prompt_token_total / denominator:.1f} "
+            f"low_variance_groups={low_variance_groups}/{profiled_groups} "
+            f"{phase_summary}")
+        if args.device.startswith("cuda"):
+            peak_allocated = torch.cuda.max_memory_allocated(args.device)
+            peak_reserved = torch.cuda.max_memory_reserved(args.device)
+            total_memory = torch.cuda.get_device_properties(args.device).total_memory
+            log(f"[PROFILE] max_memory_allocated_gib={peak_allocated / (1024 ** 3):.2f} "
+                f"max_memory_reserved_gib={peak_reserved / (1024 ** 3):.2f} "
+                f"approx_allocated_headroom_gib="
+                f"{(total_memory - peak_allocated) / (1024 ** 3):.2f}")
 
 
 if __name__ == "__main__":
