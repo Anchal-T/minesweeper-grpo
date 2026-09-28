@@ -110,6 +110,7 @@ def main():
     ap.add_argument("--out-dir", default="runs/grpo")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--hub-repo", default=os.environ.get("HF_REPO_ID"))
+    ap.add_argument("--hub-every", type=int, default=500)
     ap.add_argument("--time-budget-min", type=float, default=690)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--eval-every", type=int, default=100)
@@ -118,6 +119,8 @@ def main():
     args = ap.parse_args()
     if args.group <= 0:
         ap.error("--group must be positive")
+    if args.hub_every <= 0:
+        ap.error("--hub-every must be positive")
     policy_batch_size = args.micro_batch // args.group * args.group
     if policy_batch_size == 0:
         ap.error("--micro-batch must be at least one group")
@@ -125,6 +128,7 @@ def main():
         ap.error("CoT phase 2 uses posterior or vpr rewards, not truth reward")
     if args.max_new_tokens is None:
         args.max_new_tokens = 160 if args.answer_format == "cot" else 6
+    budget_started = time.monotonic()
 
     if args.profile_phases and args.device.startswith("cuda"):
         if not torch.cuda.is_available():
@@ -166,7 +170,6 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, "log.txt")
     started = time.monotonic()
-    budget_started = initialization_started if args.profile_phases else started
 
     def log(msg):
         print(msg, flush=True)
@@ -341,7 +344,10 @@ def main():
             if args.profile_phases and args.device.startswith("cuda"):
                 torch.cuda.synchronize(args.device)
             save_started = time.perf_counter()
-            save_checkpoint(checkpoint_dir, model, opt, scaler, step, args.hub_repo)
+            upload_now = (step % args.hub_every == 0 or step == args.steps
+                          or budget_hit)
+            save_checkpoint(checkpoint_dir, model, opt, scaler, step,
+                            args.hub_repo if upload_now else None)
             if args.profile_phases:
                 if args.device.startswith("cuda"):
                     torch.cuda.synchronize(args.device)

@@ -63,12 +63,16 @@ def main():
     ap.add_argument("--save-every", type=int, default=100)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--hub-repo", default=os.environ.get("HF_REPO_ID"))
+    ap.add_argument("--hub-every", type=int, default=500)
     ap.add_argument("--time-budget-min", type=float, default=690)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     if args.answer_format == "cot" and args.target != "posterior":
         ap.error("CoT targets are generated from the posterior oracle")
+    if args.hub_every <= 0:
+        ap.error("--hub-every must be positive")
 
+    budget_started = time.monotonic()
     if args.resume:
         restore_from_hub(args.out, args.hub_repo)
     tok = load_tokenizer(args.model)
@@ -81,6 +85,7 @@ def main():
     start_step = load_training_state(args.out, opt, scaler, args.device) if (
         args.resume and os.path.exists(os.path.join(args.out, "training.pt"))) else 0
     started = time.monotonic()
+    last_saved_step = None
     model.train()
     for step in range(start_step + 1, args.steps + 1):
         ctx_ids, ctx_attn, ans_ids, ans_attn = build_batch(
@@ -100,13 +105,19 @@ def main():
             rate = elapsed / max(1, step - start_step)
             print(f"[SFT] step={step} loss={loss.item():.4f} "
                   f"seconds_per_step={rate:.2f}", flush=True)
-        if step % args.save_every == 0:
-            save_checkpoint(args.out, model, opt, scaler, step, args.hub_repo)
-        if time_budget_expired(started, args.time_budget_min):
+        budget_hit = time_budget_expired(budget_started, args.time_budget_min)
+        should_save = step % args.save_every == 0 or step == args.steps or budget_hit
+        if should_save:
+            upload_now = (step % args.hub_every == 0 or step == args.steps
+                          or budget_hit)
+            save_checkpoint(args.out, model, opt, scaler, step,
+                            args.hub_repo if upload_now else None)
+            last_saved_step = step
+        if budget_hit:
             print("[SFT] time_budget_reached saving_checkpoint=true", flush=True)
             break
-    save_checkpoint(args.out, model, opt, scaler,
-                    step if 'step' in locals() else start_step, args.hub_repo)
+    if last_saved_step is None:
+        save_checkpoint(args.out, model, opt, scaler, start_step, args.hub_repo)
 
 
 if __name__ == "__main__":
