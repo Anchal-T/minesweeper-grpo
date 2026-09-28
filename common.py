@@ -96,51 +96,18 @@ def _answer_logits(model, full, attn, answer_start, answer_length):
     return lm_head(hidden[:, positions, :])
 
 
-def _cached_answer_logits(model, ctx_ids, answer_ids, ctx_attn, ans_attn,
-                          context_repeats):
-    if ctx_ids.shape[0] % context_repeats:
-        raise ValueError("batch size must be divisible by context_repeats")
-    transformer, lm_head = _transformer_and_head(model)
-    unique_ctx = ctx_ids[::context_repeats]
-    unique_attn = ctx_attn[::context_repeats]
-    position_ids = unique_attn.cumsum(-1) - 1
-    position_ids.clamp_(min=0)
-    prefill = transformer(input_ids=unique_ctx, attention_mask=unique_attn,
-                          position_ids=position_ids, use_cache=True)
-    first_logits = lm_head(prefill.last_hidden_state[:, -1:, :])
-    if answer_ids.shape[1] == 1:
-        return first_logits.repeat_interleave(context_repeats, dim=0)
-
-    cache = prefill.past_key_values
-    cache.batch_repeat_interleave(context_repeats)
-    answer_inputs = answer_ids[:, :-1]
-    answer_attn = ans_attn[:, :-1]
-    attention = torch.cat([ctx_attn, answer_attn], dim=1)
-    answer_positions = attention.cumsum(-1)[:, ctx_ids.shape[1]:] - 1
-    answer_positions.clamp_(min=0)
-    hidden = transformer(input_ids=answer_inputs, attention_mask=attention,
-                         position_ids=answer_positions, past_key_values=cache,
-                         use_cache=True).last_hidden_state
-    return torch.cat([first_logits.repeat_interleave(context_repeats, dim=0),
-                      lm_head(hidden)], dim=1)
-
-
 def token_logprobs(model, ctx_ids, answer_ids, attn_mask=None, answer_mask=None,
-                   pad_id=None, context_repeats=1):
-    """Return answer token log-probs, mask, and entropy without full-sequence logits."""
+                   pad_id=None):
+    """Return answer log-probs and entropy, projecting logits only at answer positions."""
     _, context_length = ctx_ids.shape
     answer_length = answer_ids.shape[1]
     pad_id = 0 if pad_id is None else pad_id
     ctx_attn = (ctx_ids != pad_id).long() if attn_mask is None else attn_mask.long()
     ans_attn = ((answer_ids != pad_id).long() if answer_mask is None
                 else answer_mask.long())
-    if context_repeats == 1:
-        full = torch.cat([ctx_ids, answer_ids], dim=1)
-        attn = torch.cat([ctx_attn, ans_attn], dim=1)
-        logits = _answer_logits(model, full, attn, context_length, answer_length)
-    else:
-        logits = _cached_answer_logits(model, ctx_ids, answer_ids, ctx_attn,
-                                       ans_attn, context_repeats)
+    full = torch.cat([ctx_ids, answer_ids], dim=1)
+    attn = torch.cat([ctx_attn, ans_attn], dim=1)
+    logits = _answer_logits(model, full, attn, context_length, answer_length)
     log_z = torch.logsumexp(logits.float(), dim=-1)
     token_logits = torch.gather(logits.float(), -1, answer_ids.unsqueeze(-1)).squeeze(-1)
     logprobs = token_logits - log_z

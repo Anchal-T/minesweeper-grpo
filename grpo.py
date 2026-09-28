@@ -8,8 +8,8 @@ import torch
 
 from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
-from common import (_cached_answer_logits, MODEL_NAME, load_model, load_tokenizer,
-                    prompt_token_padded, sample_completions, token_logprobs)
+from common import (MODEL_NAME, load_model, load_tokenizer, prompt_token_padded,
+                    sample_completions, token_logprobs)
 from env import Minesweeper, parse_move, posterior_reward, step_reward
 
 
@@ -83,47 +83,6 @@ def compute_advantages(rewards, group, norm="std", min_group_std=1e-3):
     return advantage.reshape(-1), int(low_variance.sum().item())
 
 
-def verify_cached_logprobs(model, optimizer, tok, ctx_ids, answer_ids,
-                           ctx_attn, answer_mask, group, device):
-    with torch.autocast("cuda", dtype=torch.float16,
-                        enabled=str(device).startswith("cuda")):
-        with torch.no_grad():
-            full_lp, full_mask, _ = token_logprobs(
-                model, ctx_ids, answer_ids, attn_mask=ctx_attn,
-                answer_mask=answer_mask, pad_id=tok.pad_token_id)
-        cached_lp, cached_mask, _ = token_logprobs(
-            model, ctx_ids, answer_ids, attn_mask=ctx_attn,
-            answer_mask=answer_mask, pad_id=tok.pad_token_id,
-            context_repeats=group)
-    valid = full_mask.bool()
-    errors = (full_lp - cached_lp.detach()).abs()
-    max_error = errors.masked_select(valid).max().item()
-    if max_error > 1e-3:
-        per_token = errors.masked_fill(~valid, 0).amax(dim=0).tolist()
-        del cached_lp, cached_mask
-        with torch.no_grad():
-            expanded_logits = _cached_answer_logits(
-                model, ctx_ids, answer_ids, ctx_attn, answer_mask, 1)
-            expanded_lp = torch.log_softmax(expanded_logits.float(), dim=-1)
-            expanded_lp = expanded_lp.gather(
-                -1, answer_ids.unsqueeze(-1)).squeeze(-1)
-            expanded_error = (full_lp - expanded_lp).abs()
-            expanded_max_error = expanded_error.masked_select(valid).max().item()
-        raise AssertionError(f"cached log-probs differ by {max_error:.6g}; "
-                             f"max error by token={per_token}; "
-                             f"non-deduplicated cache error={expanded_max_error:.6g}")
-    optimizer.zero_grad(set_to_none=True)
-    (cached_lp * cached_mask).sum().backward()
-    grad_square = sum(
-        p.grad.detach().float().square().sum()
-        for p in model.parameters() if p.requires_grad and p.grad is not None)
-    grad_norm = float(torch.sqrt(grad_square)) if isinstance(grad_square, torch.Tensor) else 0.0
-    optimizer.zero_grad(set_to_none=True)
-    if not torch.isfinite(torch.tensor(grad_norm)) or grad_norm <= 0:
-        raise AssertionError("cached forward did not produce finite adapter gradients")
-    return max_error, grad_norm
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL_NAME)
@@ -156,8 +115,6 @@ def main():
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--profile-phases", action="store_true",
                     help="report rollout, reward, policy, reference, and save timings")
-    ap.add_argument("--verify-kv-cache", action="store_true",
-                    help="check cached log-probs and gradients against the full-sequence path")
     args = ap.parse_args()
     if args.group <= 0:
         ap.error("--group must be positive")
@@ -263,11 +220,14 @@ def main():
                 format_reward=args.format_reward, phase_times=rollout_times)
             roll_lp = None
             if args.epochs_per_batch > 1:
-                roll_lp, _, _ = token_logprobs(
-                    model, ctx_ids, answer_ids, attn_mask=ctx_attn,
-                    answer_mask=answer_mask, pad_id=tok.pad_token_id,
-                    context_repeats=args.group)
-                roll_lp = roll_lp.detach()
+                roll_lps = []
+                for offset in range(0, ctx_ids.shape[0], policy_batch_size):
+                    sl = slice(offset, offset + policy_batch_size)
+                    roll_lps.append(token_logprobs(
+                        model, ctx_ids[sl], answer_ids[sl],
+                        attn_mask=ctx_attn[sl], answer_mask=answer_mask[sl],
+                        pad_id=tok.pad_token_id)[0])
+                roll_lp = torch.cat(roll_lps, dim=0).detach()
         if args.profile_phases:
             assert rollout_times is not None
             if args.device.startswith("cuda"):
@@ -278,16 +238,7 @@ def main():
             prompt_token_total += ctx_attn.sum().item() / ctx_attn.shape[0]
             profiled_steps += 1
             profiled_groups += args.prompts_per_step
-        if args.verify_kv_cache and step == start_step + 1:
-            test_rows = min(policy_batch_size, ctx_ids.shape[0])
-            max_error, grad_norm = verify_cached_logprobs(
-                model, opt, tok, ctx_ids[:test_rows], answer_ids[:test_rows],
-                ctx_attn[:test_rows], answer_mask[:test_rows], args.group,
-                args.device)
-            log(f"[PROBE] kv_logprob_max_abs_error={max_error:.6g} "
-                f"cached_adapter_grad_norm={grad_norm:.6g}")
-            if args.device.startswith("cuda"):
-                torch.cuda.reset_peak_memory_stats(args.device)
+
         advantages, low_groups = compute_advantages(
             rewards, args.group, args.adv_norm, args.min_group_std)
         advantages = advantages.to(args.device)
@@ -304,10 +255,14 @@ def main():
             with torch.no_grad(), model.disable_adapter(), torch.autocast(
                     "cuda", dtype=torch.float16,
                     enabled=args.device.startswith("cuda")):
-                ref_lp, _, _ = token_logprobs(
-                    model, ctx_ids, answer_ids, attn_mask=ctx_attn,
-                    answer_mask=answer_mask, pad_id=tok.pad_token_id,
-                    context_repeats=args.group)
+                ref_lps = []
+                for offset in range(0, ctx_ids.shape[0], policy_batch_size):
+                    sl = slice(offset, offset + policy_batch_size)
+                    ref_lps.append(token_logprobs(
+                        model, ctx_ids[sl], answer_ids[sl],
+                        attn_mask=ctx_attn[sl], answer_mask=answer_mask[sl],
+                        pad_id=tok.pad_token_id)[0])
+                ref_lp = torch.cat(ref_lps, dim=0)
             if args.profile_phases:
                 if args.device.startswith("cuda"):
                     torch.cuda.synchronize(args.device)
@@ -322,8 +277,7 @@ def main():
                                     enabled=args.device.startswith("cuda")):
                     lp, mask, entropy = token_logprobs(
                         model, ctx_ids[sl], answer_ids[sl], attn_mask=ctx_attn[sl],
-                        answer_mask=answer_mask[sl], pad_id=tok.pad_token_id,
-                        context_repeats=args.group)
+                        answer_mask=answer_mask[sl], pad_id=tok.pad_token_id)
                     adv = advantages[sl].unsqueeze(1)
                     policy_terms = adv * lp
                     if roll_lp is not None:
