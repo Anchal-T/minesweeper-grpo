@@ -8,8 +8,8 @@ import torch
 
 from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
-from common import (MODEL_NAME, load_model, load_tokenizer, prompt_token_padded,
-                    sample_completions, token_logprobs)
+from common import (_cached_answer_logits, MODEL_NAME, load_model, load_tokenizer,
+                    prompt_token_padded, sample_completions, token_logprobs)
 from env import Minesweeper, parse_move, posterior_reward, step_reward
 
 
@@ -100,8 +100,18 @@ def verify_cached_logprobs(model, optimizer, tok, ctx_ids, answer_ids,
     max_error = errors.masked_select(valid).max().item()
     if max_error > 1e-3:
         per_token = errors.masked_fill(~valid, 0).amax(dim=0).tolist()
+        del cached_lp, cached_mask
+        with torch.no_grad():
+            expanded_logits = _cached_answer_logits(
+                model, ctx_ids, answer_ids, ctx_attn, answer_mask, 1)
+            expanded_lp = torch.log_softmax(expanded_logits.float(), dim=-1)
+            expanded_lp = expanded_lp.gather(
+                -1, answer_ids.unsqueeze(-1)).squeeze(-1)
+            expanded_error = (full_lp - expanded_lp).abs()
+            expanded_max_error = expanded_error.masked_select(valid).max().item()
         raise AssertionError(f"cached log-probs differ by {max_error:.6g}; "
-                             f"max error by token={per_token}")
+                             f"max error by token={per_token}; "
+                             f"non-deduplicated cache error={expanded_max_error:.6g}")
     optimizer.zero_grad(set_to_none=True)
     (cached_lp * cached_mask).sum().backward()
     grad_square = sum(
