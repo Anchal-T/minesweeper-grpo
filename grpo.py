@@ -96,9 +96,12 @@ def verify_cached_logprobs(model, optimizer, tok, ctx_ids, answer_ids,
             answer_mask=answer_mask, pad_id=tok.pad_token_id,
             context_repeats=group)
     valid = full_mask.bool()
-    max_error = (full_lp - cached_lp.detach()).abs().masked_select(valid).max().item()
+    errors = (full_lp - cached_lp.detach()).abs()
+    max_error = errors.masked_select(valid).max().item()
     if max_error > 1e-3:
-        raise AssertionError(f"cached log-probs differ by {max_error:.6g}")
+        per_token = errors.masked_fill(~valid, 0).amax(dim=0).tolist()
+        raise AssertionError(f"cached log-probs differ by {max_error:.6g}; "
+                             f"max error by token={per_token}")
     optimizer.zero_grad(set_to_none=True)
     (cached_lp * cached_mask).sum().backward()
     grad_square = sum(
