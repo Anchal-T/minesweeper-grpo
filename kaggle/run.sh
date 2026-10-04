@@ -40,6 +40,7 @@ fi
 cd "$WORKDIR"
 "$PY" -m pip uninstall -y -q torchao >/dev/null 2>&1 || true
 "$PY" -m pip install -q peft transformers huggingface_hub
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p logs runs
 
 stage() {

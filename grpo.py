@@ -9,7 +9,7 @@ import torch
 from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
 from common import (MODEL_NAME, load_model, load_tokenizer, prompt_token_padded,
-                    sample_completions, token_logprobs)
+                    sample_grouped_completions, token_logprobs)
 from env import Minesweeper, parse_move, posterior_reward, step_reward
 
 
@@ -18,11 +18,10 @@ def rollout_batch(model, tok, n_prompts, group, temperature, device,
                   answer_format="move", format_reward=0.0, phase_times=None):
     boards = [Minesweeper(n_mines=n_mines) for _ in range(n_prompts)]
     prompts = [b.prompt() for b in boards]
-    rep_prompts = [p for p in prompts for _ in range(group)]
     generation_started = time.perf_counter() if phase_times is not None else 0.0
-    texts, gen_ids, ctx_ids, ctx_attn = sample_completions(
-        model, tok, rep_prompts, max_new_tokens=max_new_tokens,
-        temperature=temperature, greedy=False, return_inputs=True)
+    texts, gen_ids, ctx_ids, ctx_attn = sample_grouped_completions(
+        model, tok, prompts, group, max_new_tokens=max_new_tokens,
+        temperature=temperature)
     if phase_times is not None:
         phase_times["generation"] = time.perf_counter() - generation_started
     reward_started = time.perf_counter() if phase_times is not None else 0.0
@@ -229,7 +228,7 @@ def main():
                     roll_lps.append(token_logprobs(
                         model, ctx_ids[sl], answer_ids[sl],
                         attn_mask=ctx_attn[sl], answer_mask=answer_mask[sl],
-                        pad_id=tok.pad_token_id)[0])
+                        pad_id=tok.pad_token_id, context_repeats=args.group)[0])
                 roll_lp = torch.cat(roll_lps, dim=0).detach()
         if args.profile_phases:
             assert rollout_times is not None
@@ -264,7 +263,7 @@ def main():
                     ref_lps.append(token_logprobs(
                         model, ctx_ids[sl], answer_ids[sl],
                         attn_mask=ctx_attn[sl], answer_mask=answer_mask[sl],
-                        pad_id=tok.pad_token_id)[0])
+                        pad_id=tok.pad_token_id, context_repeats=args.group)[0])
                 ref_lp = torch.cat(ref_lps, dim=0)
             if args.profile_phases:
                 if args.device.startswith("cuda"):
@@ -280,7 +279,8 @@ def main():
                                     enabled=args.device.startswith("cuda")):
                     lp, mask, entropy = token_logprobs(
                         model, ctx_ids[sl], answer_ids[sl], attn_mask=ctx_attn[sl],
-                        answer_mask=answer_mask[sl], pad_id=tok.pad_token_id)
+                        answer_mask=answer_mask[sl], pad_id=tok.pad_token_id,
+                        context_repeats=args.group)
                     adv = advantages[sl].unsqueeze(1)
                     policy_terms = adv * lp
                     if roll_lp is not None:
