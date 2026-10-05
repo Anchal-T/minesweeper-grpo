@@ -60,25 +60,27 @@ def held_out_states(n, seed=0):
 
 
 @torch.no_grad()
-def measure(model, tok, states, device):
-    """Compare checkpoints the way the policy is used: one T=1 sample per
-    position. Returns (single-move accuracy on positions with a provable safe
-    cell, mean answer entropy, number of such positions)."""
+def measure(model, tok, states, device, samples=4):
+    """Compare checkpoints the way the policy is used: T=1 samples per position
+    (`samples` of them, because one sample per position is too noisy to rank
+    checkpoints on). Returns (single-move accuracy on positions with a provable
+    safe cell, mean answer entropy, those positions x samples decisions)."""
     texts, generated, ctx_ids, ctx_attn = sample_completions(
-        model, tok, [state.prompt() for state in states], max_new_tokens=6,
-        temperature=1.0, return_inputs=True)
+        model, tok, [state.prompt() for state in states for _ in range(samples)],
+        max_new_tokens=6, temperature=1.0, return_inputs=True)
     answer_mask = (generated != tok.pad_token_id).long()
     _, mask, entropy = token_logprobs(
         model, ctx_ids, generated, attn_mask=ctx_attn,
         answer_mask=answer_mask, pad_id=tok.pad_token_id)
     safe_positions = safe_actions = 0
-    for state, text in zip(states, texts):
+    for index, state in enumerate(states):
         posterior = mine_posterior(state)
         if min(posterior.values()) >= 1e-12:
             continue
-        safe_positions += 1
-        move = parse_move(text)
-        safe_actions += bool(move in posterior and posterior[move] < 1e-12)
+        safe_positions += samples
+        for text in texts[index * samples:(index + 1) * samples]:
+            move = parse_move(text)
+            safe_actions += bool(move in posterior and posterior[move] < 1e-12)
     return (safe_actions / max(1, safe_positions),
             float((entropy * mask).sum() / mask.sum().clamp_min(1)),
             safe_positions)
