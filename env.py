@@ -1,6 +1,8 @@
 """Minesweeper environment with text rendering, verifiable rewards, and an expert policy.
 
-Board is rendered row-major; cells are separated by spaces:
+Boards, rendering, and prompt match CAST (github.com/Wloner0809/CAST) so
+results are comparable to its published table. The board is rendered with
+right-justified column headers and 3-character cells:
   '.'  hidden
   '0'-'8' revealed, digit = adjacent mines
   '*'  mine (only shown for debugging / terminal states)
@@ -9,18 +11,57 @@ Coordinates are (row, col), 0-indexed.
 import random
 from math import comb
 
+# CAST draws its train and eval seeds from [0, 1_000_000). Training boards use
+# seeds above that pool so a training board can never be an evaluation board.
+TRAIN_SEED_START = 1_000_000
+
+
+def generate_layout(seed, rows, cols, num_mines):
+    """CAST's deterministic layout: random first click, 3x3 safe zone around it,
+    then mines by rejection sampling from the same RNG stream. Returns
+    (mine positions, first click). The RNG draw order must not change: it is what
+    makes a seed reproduce the same board as the reference implementation."""
+    rng = random.Random(seed)
+    fc_r, fc_c = rng.randint(0, rows - 1), rng.randint(0, cols - 1)
+    safe_3x3 = {(fc_r + dr, fc_c + dc)
+                for dr in range(-1, 2) for dc in range(-1, 2)
+                if 0 <= fc_r + dr < rows and 0 <= fc_c + dc < cols}
+    total_cells = rows * cols
+    safe_zone = safe_3x3
+    if total_cells - len(safe_3x3) < num_mines:
+        safe_zone = {(fc_r, fc_c)}
+        num_mines = min(num_mines, total_cells - 1)
+    mines = set()
+    while len(mines) < num_mines:
+        r, c = rng.randint(0, rows - 1), rng.randint(0, cols - 1)
+        if (r, c) in mines or (r, c) in safe_zone:
+            continue
+        mines.add((r, c))
+    return sorted(mines), (fc_r, fc_c)
+
 
 class Minesweeper:
-    def __init__(self, width=6, height=6, n_mines=6, seed=None):
+    def __init__(self, width=6, height=6, n_mines=7, seed=None,
+                 mine_positions=None, first_click=None):
         self.w, self.h, self.n_mines = width, height, n_mines
-        rng = random.Random(seed)
-        cells = [(r, c) for r in range(height) for c in range(width)]
-        self.mines = set(rng.sample(cells, n_mines))
+        if mine_positions is None:
+            mine_positions, first_click = generate_layout(
+                seed if seed is not None else random.randrange(1 << 30),
+                height, width, n_mines)
+        self.mines = {(r, c) for r, c in mine_positions}
         self.revealed = set()
-        # seed the game with one random safe cell + flood fill, so states are
-        # mid-game positions rather than a fully hidden board
-        safe = [c for c in cells if c not in self.mines]
-        self._flood(*rng.choice(safe))
+        # CAST auto-reveals the first click with flood fill, so states are
+        # mid-game positions rather than a fully hidden board; a first click that
+        # clears every safe cell leaves the board solved.
+        self._flood(*first_click)
+
+    def _clone(self, revealed=None):
+        """Copy of this board: same mines, optionally a different revealed set."""
+        clone = Minesweeper.__new__(Minesweeper)
+        clone.w, clone.h, clone.n_mines = self.w, self.h, self.n_mines
+        clone.mines = self.mines
+        clone.revealed = set(self.revealed if revealed is None else revealed)
+        return clone
 
     def _neighbors(self, r, c):
         for dr in (-1, 0, 1):
@@ -71,19 +112,19 @@ class Minesweeper:
                 if (r, c) not in self.revealed]
 
     def render(self):
-        rows = []
+        """CAST's layout: right-justified column header, 3-character cells."""
+        lines = ["   " + " ".join(str(c).rjust(2) for c in range(self.w))]
         for r in range(self.h):
-            row = []
+            row = f"{r:2} "
             for c in range(self.w):
-                if (r, c) in self.revealed:
-                    row.append(str(self.adjacent_mines(r, c)))
-                else:
-                    row.append(".")
-            rows.append(" ".join(row))
-        return "\n".join(rows)
+                row += (f" {self.adjacent_mines(r, c)} "
+                        if (r, c) in self.revealed else " . ")
+            lines.append(row)
+        return "\n".join(lines)
 
     def prompt(self):
-        return (f"Minesweeper {self.w}x{self.h} grid, {self.n_mines} mines. "
+        # No mine count: CAST never tells the agent how many mines are left.
+        return (f"Minesweeper {self.w}x{self.h} grid with hidden mines. "
                 f"'.' = hidden, digit = adjacent mines.\n"
                 f"{self.render()}\n"
                 f"Which hidden cell is safe? Answer with row,col (0-indexed). "
@@ -105,11 +146,7 @@ def step_reward(board, r, c):
     if board.is_mine(r, c):
         return -1.0, True
     hidden_before = len(board.hidden_cells())
-    probe = Minesweeper.__new__(Minesweeper)
-    probe.w, probe.h, probe.n_mines = board.w, board.h, board.n_mines
-    probe.mines = board.mines
-    probe.revealed = set(board.revealed)
-    n = probe._flood(r, c)
+    n = board._clone()._flood(r, c)
     return 0.5 + 0.5 * (n / hidden_before), False
 
 
@@ -122,11 +159,7 @@ def expert_move(board, rng=None):
     for (r, c) in board.hidden_cells():
         if board.is_mine(r, c):
             continue
-        probe = Minesweeper.__new__(Minesweeper)
-        probe.w, probe.h, probe.n_mines = board.w, board.h, board.n_mines
-        probe.mines = board.mines
-        probe.revealed = set(board.revealed)
-        gain = probe._flood(r, c)
+        gain = board._clone()._flood(r, c)
         if gain > best_gain:
             best, best_gain = (r, c), gain
     return best
@@ -212,16 +245,48 @@ def mine_posterior(board):
     return probabilities
 
 
-def posterior_move(board):
-    """Pick a minimum-risk hidden cell, breaking ties in row-major order."""
+def posterior_move(board, rng=None):
+    """Pick a minimum-risk hidden cell, breaking ties in row-major order.
+
+    Passing rng breaks ties at random instead, which keeps generated training
+    states from all funneling through the same tie-choice cells."""
     posterior = mine_posterior(board)
     if not posterior:
         return None
     p_min = min(posterior.values())
-    candidates = [cell for cell, p in posterior.items() if abs(p - p_min) < 1e-12]
+    candidates = sorted(cell for cell, p in posterior.items()
+                        if abs(p - p_min) < 1e-12)
     # Exact expected flood-fill gain would enumerate hundreds of thousands of
     # full layouts on common boards; keep target selection inexpensive.
-    return min(candidates)
+    return candidates[0] if rng is None else rng.choice(candidates)
+
+
+def sample_state(width=6, height=6, n_mines=7, seed=None, rng=None):
+    """A training position drawn uniformly from the states a game passes through.
+
+    Starts from a CAST-style layout whose first click CAST already revealed and
+    plays the posterior solver (random tie-break) until it would lose, keeping
+    every position along the way. Sampling the whole game instead of only the
+    opening is the point: evaluation plays full games, and the late positions
+    with no provable safe cell are the ones a policy actually fails on. Unsolved
+    states only, so the returned board always has a hidden cell to open.
+    """
+    if rng is None:
+        rng = random.Random(seed)
+    while True:
+        board = Minesweeper(width, height, n_mines,
+                            seed=rng.randrange(TRAIN_SEED_START, 1 << 30))
+        states = [] if board.solved() else [set(board.revealed)]
+        while not board.solved():
+            move = posterior_move(board, rng)
+            if move is None or board.is_mine(*move):
+                break
+            board.click(*move)
+            if not board.solved():
+                states.append(set(board.revealed))
+        # An empty list means the first click cleared the board: draw another.
+        if states:
+            return board._clone(rng.choice(states))
 
 
 def posterior_reward(board, r, c, mode="posterior", posterior=None):
