@@ -10,13 +10,14 @@ from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
 from common import (MODEL_NAME, load_model, load_tokenizer, prompt_token_padded,
                     sample_grouped_completions, token_logprobs)
-from env import Minesweeper, parse_move, posterior_reward, step_reward
+from env import Minesweeper, parse_move, posterior_reward, sample_state, step_reward
 
 
 def rollout_batch(model, tok, n_prompts, group, temperature, device,
-                  max_new_tokens=6, n_mines=6, reward_mode="truth",
+                  max_new_tokens=6, n_mines=7, reward_mode="truth",
                   answer_format="move", format_reward=0.0, phase_times=None):
-    boards = [Minesweeper(n_mines=n_mines) for _ in range(n_prompts)]
+    # Roll out on mid-game positions, not openings: evaluation plays whole games.
+    boards = [sample_state(n_mines=n_mines) for _ in range(n_prompts)]
     prompts = [b.prompt() for b in boards]
     generation_started = time.perf_counter() if phase_times is not None else 0.0
     texts, gen_ids, ctx_ids, ctx_attn = sample_grouped_completions(
@@ -195,7 +196,7 @@ def main():
         for mines, until in stages:
             if step <= until:
                 return mines
-        return stages[-1][0] if stages else 6
+        return stages[-1][0] if stages else 7
 
     reward_total = mine_total = sample_total = 0.0
     phase_totals = {name: 0.0 for name in

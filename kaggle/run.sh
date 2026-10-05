@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kaggle phase-1 training: posterior SFT, then truth/posterior GRPO.
+# Kaggle phase-1 training: posterior SFT, then a KL 0 versus 0.05 GRPO ablation.
 set -euo pipefail
 SECONDS=0
 
@@ -22,9 +22,8 @@ else
   PROMPTS_PER_STEP=${PROMPTS_PER_STEP:-16}
   GROUP_SIZE=${GROUP_SIZE:-8}
   MICRO_BATCH=${MICRO_BATCH:-32}
-  EVAL_GAMES=${EVAL_GAMES:-4}
+  EVAL_BOARDS=${EVAL_BOARDS:-4}
   DEVICE=cuda
-  MAX_EVAL_MOVES=${MAX_EVAL_MOVES:-0}
   TRAINING_CUTOFF_SECONDS=$(((SESSION_LIMIT_MIN - EVAL_RESERVE_MIN - SESSION_MARGIN_MIN) * 60))
   if ((TRAINING_CUTOFF_SECONDS <= 0)); then
     echo "SESSION_LIMIT_MIN must exceed EVAL_RESERVE_MIN + SESSION_MARGIN_MIN" >&2
@@ -67,12 +66,12 @@ remaining_training_minutes() {
 }
 
 SFT_ARGS=()
-TRUTH_ARGS=()
-POSTERIOR_ARGS=()
+KL0_ARGS=()
+KL005_ARGS=()
 if [ -n "$BASE_REPO" ]; then
   SFT_ARGS+=(--hub-repo "${BASE_REPO}-sft")
-  TRUTH_ARGS+=(--hub-repo "${BASE_REPO}-truth")
-  POSTERIOR_ARGS+=(--hub-repo "${BASE_REPO}-posterior")
+  KL0_ARGS+=(--hub-repo "${BASE_REPO}-kl0")
+  KL005_ARGS+=(--hub-repo "${BASE_REPO}-kl005")
 fi
 
 GPU_COUNT=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)
@@ -91,45 +90,42 @@ else
 fi
 
 run_grpo() {
-  local reward=$1 gpu=$2 logfile=$3 budget=$4
-  shift 4
-  stage "GRPO reward=$reward gpu=$gpu steps=$GRPO_STEPS budget=${budget}m"
-  CUDA_VISIBLE_DEVICES="$gpu" "$PY" grpo.py --init-from runs/sft/last --reward "$reward" \
-    --adv-norm none --kl-coef 0.05 --steps "$GRPO_STEPS" \
+  local name=$1 gpu=$2 logfile=$3 budget=$4 kl=$5
+  shift 5
+  stage "GRPO name=$name gpu=$gpu kl_coef=$kl steps=$GRPO_STEPS budget=${budget}m"
+  CUDA_VISIBLE_DEVICES="$gpu" "$PY" grpo.py --init-from runs/sft/last --reward posterior \
+    --adv-norm none --kl-coef "$kl" --steps "$GRPO_STEPS" \
     --prompts-per-step "$PROMPTS_PER_STEP" --group "$GROUP_SIZE" --micro-batch "$MICRO_BATCH" \
-    --device "$DEVICE" --lr 1e-5 --out-dir "runs/$reward" --resume \
+    --device "$DEVICE" --lr 1e-5 --out-dir "runs/$name" --resume \
     --hub-every "$HUB_UPLOAD_EVERY" --time-budget-min "$budget" "$@" 2>&1 | tee "$logfile"
 }
 
-stage "GRPO A/B steps=$GRPO_STEPS prompts=$PROMPTS_PER_STEP group=$GROUP_SIZE gpu_count=$GPU_COUNT"
+stage "GRPO KL ablation steps=$GRPO_STEPS prompts=$PROMPTS_PER_STEP group=$GROUP_SIZE gpu_count=$GPU_COUNT"
 if ((GPU_COUNT >= 2)); then
   if stage_budget=$(remaining_training_minutes); then
-    run_grpo truth 0 logs/truth.log "$stage_budget" "${TRUTH_ARGS[@]}" &
-    truth_pid=$!
-    run_grpo posterior 1 logs/posterior.log "$stage_budget" "${POSTERIOR_ARGS[@]}" &
-    posterior_pid=$!
-    wait "$truth_pid"
-    wait "$posterior_pid"
+    run_grpo kl0 0 logs/kl0.log "$stage_budget" 0 "${KL0_ARGS[@]}" &
+    kl0_pid=$!
+    run_grpo kl005 1 logs/kl005.log "$stage_budget" 0.05 "${KL005_ARGS[@]}" &
+    kl005_pid=$!
+    wait "$kl0_pid"
+    wait "$kl005_pid"
   else
     stage "GRPO skipped: training deadline reached"
   fi
 else
   if stage_budget=$(remaining_training_minutes); then
-    run_grpo truth 0 logs/truth.log "$stage_budget" "${TRUTH_ARGS[@]}"
+    run_grpo kl0 0 logs/kl0.log "$stage_budget" 0 "${KL0_ARGS[@]}"
   else
-    stage "truth GRPO skipped: training deadline reached"
+    stage "kl0 GRPO skipped: training deadline reached"
   fi
   if stage_budget=$(remaining_training_minutes); then
-    run_grpo posterior 0 logs/posterior.log "$stage_budget" "${POSTERIOR_ARGS[@]}"
+    run_grpo kl005 0 logs/kl005.log "$stage_budget" 0.05 "${KL005_ARGS[@]}"
   else
-    stage "posterior GRPO skipped: training deadline reached"
+    stage "kl005 GRPO skipped: training deadline reached"
   fi
 fi
 
-EVAL_ARGS=()
-if [ "$MAX_EVAL_MOVES" -gt 0 ]; then
-  EVAL_ARGS+=(--max-moves "$MAX_EVAL_MOVES")
-fi
+EVAL_ARGS=(--boards "$EVAL_BOARDS")
 
 run_eval() {
   local name=$1 checkpoint=$2
@@ -146,9 +142,9 @@ run_eval() {
     stage "EVALUATION $name skipped: session margin reached"
     return 0
   fi
-  stage "EVALUATION $name games=$EVAL_GAMES timeout=${eval_seconds}s"
+  stage "EVALUATION $name boards=$EVAL_BOARDS timeout=${eval_seconds}s"
   if CUDA_VISIBLE_DEVICES=0 timeout --signal=INT "${eval_seconds}s" "$PY" eval.py \
-      --ckpt "$checkpoint" --games "$EVAL_GAMES" --device "$DEVICE" "${EVAL_ARGS[@]}" \
+      --ckpt "$checkpoint" --device "$DEVICE" "${EVAL_ARGS[@]}" \
       2>&1 | tee "logs/eval-$name.log"; then
     :
   else
@@ -157,5 +153,5 @@ run_eval() {
   fi
 }
 
-run_eval truth runs/truth/last
-run_eval posterior runs/posterior/last
+run_eval kl0 runs/kl0/last
+run_eval kl005 runs/kl005/last

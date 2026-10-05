@@ -1,20 +1,23 @@
 """SFT warmup on posterior-optimal (or ground-truth expert) moves."""
 import argparse
 import os
+import random
 import time
 
 import torch
 
 from checkpoint import (load_training_state, restore_from_hub, save_checkpoint,
                         time_budget_expired)
-from common import MODEL_NAME, format_prompt, load_model, load_tokenizer
-from env import Minesweeper, expert_move, mine_posterior, posterior_move
+from common import (MODEL_NAME, format_prompt, load_model, load_tokenizer,
+                    sample_completions, token_logprobs)
+from env import (expert_move, mine_posterior, parse_move, posterior_move,
+                 sample_state)
 
 
 def build_batch(tok, n, device, target, answer_format="move"):
     prompts, answers = [], []
     for _ in range(n):
-        board = Minesweeper()
+        board = sample_state()
         move = posterior_move(board) if target == "posterior" else expert_move(board)
         if move is not None:
             prompts.append(format_prompt(tok, board.prompt()))
@@ -45,10 +48,40 @@ def build_batch(tok, n, device, target, answer_format="move"):
 
 
 def loss_on_batch(model, ctx_ids, ctx_attn, ans_ids, ans_attn, pad_id):
-    from common import token_logprobs
     lp, mask, _ = token_logprobs(model, ctx_ids, ans_ids, attn_mask=ctx_attn,
                                  answer_mask=ans_attn, pad_id=pad_id)
     return -(lp * mask).sum() / mask.sum()
+
+
+def held_out_states(n, seed=0):
+    """Fixed positions the checkpoints are compared on, generated once."""
+    rng = random.Random(seed)
+    return [sample_state(rng=rng) for _ in range(n)]
+
+
+@torch.no_grad()
+def measure(model, tok, states, device):
+    """Compare checkpoints the way the policy is used: one T=1 sample per
+    position. Returns (single-move accuracy on positions with a provable safe
+    cell, mean answer entropy, number of such positions)."""
+    texts, generated, ctx_ids, ctx_attn = sample_completions(
+        model, tok, [state.prompt() for state in states], max_new_tokens=6,
+        temperature=1.0, return_inputs=True)
+    answer_mask = (generated != tok.pad_token_id).long()
+    _, mask, entropy = token_logprobs(
+        model, ctx_ids, generated, attn_mask=ctx_attn,
+        answer_mask=answer_mask, pad_id=tok.pad_token_id)
+    safe_positions = safe_actions = 0
+    for state, text in zip(states, texts):
+        posterior = mine_posterior(state)
+        if min(posterior.values()) >= 1e-12:
+            continue
+        safe_positions += 1
+        move = parse_move(text)
+        safe_actions += bool(move in posterior and posterior[move] < 1e-12)
+    return (safe_actions / max(1, safe_positions),
+            float((entropy * mask).sum() / mask.sum().clamp_min(1)),
+            safe_positions)
 
 
 def main():
@@ -65,6 +98,8 @@ def main():
     ap.add_argument("--hub-repo", default=os.environ.get("HF_REPO_ID"))
     ap.add_argument("--hub-every", type=int, default=500)
     ap.add_argument("--time-budget-min", type=float, default=690)
+    ap.add_argument("--eval-states", type=int, default=64,
+                    help="held-out positions measured at T=1 at each save; 0 disables")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     if args.answer_format == "cot" and args.target != "posterior":
@@ -86,6 +121,7 @@ def main():
         args.resume and os.path.exists(os.path.join(args.out, "training.pt"))) else 0
     started = time.monotonic()
     last_saved_step = None
+    held_out = held_out_states(args.eval_states) if args.eval_states > 0 else []
     model.train()
     for step in range(start_step + 1, args.steps + 1):
         ctx_ids, ctx_attn, ans_ids, ans_attn = build_batch(
@@ -113,6 +149,14 @@ def main():
             save_checkpoint(args.out, model, opt, scaler, step,
                             args.hub_repo if upload_now else None)
             last_saved_step = step
+            if held_out:
+                model.eval()
+                accuracy, entropy, positions = measure(model, tok, held_out,
+                                                       args.device)
+                model.train()
+                print(f"[SFT] held_out positions={positions} "
+                      f"T=1 single_move_accuracy={accuracy:.3f} "
+                      f"entropy={entropy:.3f}", flush=True)
         if budget_hit:
             print("[SFT] time_budget_reached saving_checkpoint=true", flush=True)
             break
