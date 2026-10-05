@@ -125,9 +125,9 @@ def eval_tier(model, tok, layouts, tier, args):
     games = [new_game(tier, layout)
              for layout in layouts for _ in range(args.rollouts)]
     safe_positions = safe_actions = 0
-    chunk = max(1, args.batch_size // args.rollouts)
-    for start in range(0, len(games), chunk):
-        active = [g for g in games[start:start + chunk] if not g["done"]]
+    for start in range(0, len(games), args.batch_size):
+        active = [g for g in games[start:start + args.batch_size]
+                  if not g["done"]]
         while active:
             for offset in range(0, len(active), args.batch_size):
                 batch = active[offset:offset + args.batch_size]
@@ -161,7 +161,8 @@ def main():
     ap.add_argument("--rollouts", type=int, default=4)
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--batch-size", type=int, default=64,
+                    help="games sampled per forward; lower it on small GPUs")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
