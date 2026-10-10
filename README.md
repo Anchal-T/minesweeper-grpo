@@ -42,13 +42,30 @@ format, use `sft.py --answer-format cot` followed by GRPO with
 `--format-reward` to reward the required `<think>...</think> Answer: r,c` structure.
 
 `--kl-coef` is the ablation knob: `kaggle/run.sh` runs 0 and 0.05 side by side
-(see below). Over steps 21-40 of a matched 50-step ablation from the same SFT
-start, KL 0 reached mean posterior reward -0.23 against -0.31 for KL 0.05, with
+(see below). In a matched 50-step ablation from one SFT start, KL 0 reached
+mean posterior reward -0.23 against -0.31 for KL 0.05 over steps 21-40, with
 lower answer entropy (0.75 against 0.82) and fewer bad or mine moves (0.56
 against 0.65), and neither arm produced low-variance groups (0-3% of groups).
-So 0 is the default above: on a clean posterior reward the KL term only slowed
-learning, and neither arm collapsed the way the paper reports for KL 0.05
-under its older, buggy reward.
+That ablation was run at laptop scale (SFT 300 steps at batch 4), so 0 is only
+the provisional default: on a clean posterior reward the KL term slowed
+learning without the collapse the paper reports for KL 0.05 under its older,
+buggy reward. Revisit it once the Kaggle arms finish.
+
+## Results
+
+Laptop-scale warmup (SFT 300 steps at batch 4, then 50 GRPO steps at
+`--kl-coef 0`) scored with the protocol above:
+
+| tier | boards | win rate | solver ceiling | safe-move accuracy | CAST |
+|---|---|---|---|---|---|
+| id | 200 | 0.000 | 0.845 | 0.110 (495/4484) | 44.7 |
+| unseen | 200 | not run (laptop kept idle) | 0.800 | | 11.0 |
+
+The ceilings are the posterior solver on the same 200 held-out boards, so they
+bound what a policy can reach; the gap to CAST is training scale, not
+evaluation protocol. Training belongs on a Kaggle GPU: one 200-board Avg@4
+tier is 800 games of up to 40 turns, which costs well over half an hour on a
+4 GB laptop card.
 
 ## Evaluation protocol
 
@@ -60,7 +77,8 @@ under its older, buggy reward.
   against the training set. Every run scores the same positions.
 - `--rollouts 4` independent samples per board at `--temperature 0.6` and
   `--top-p 0.95` (Avg@4), one turn per action; an unparseable, off-board, or
-  already-revealed action still costs a turn.
+  already-revealed action still costs a turn. `--batch-size` (64) caps games in
+  flight, so lower it further on small GPUs.
 - Turn budgets of 30 for 6x6/7 mines and 40 for 7x7/10 mines, per the paper;
   running out of turns scores a loss.
 - Reported next to the win rate: a board-level 95% CI, the posterior solver's
